@@ -99,12 +99,14 @@ struct mlx5_nic_flow_attr {
 enum {
 	MLX5E_TC_FLOW_INGRESS	= MLX5E_TC_INGRESS,
 	MLX5E_TC_FLOW_EGRESS	= MLX5E_TC_EGRESS,
-	MLX5E_TC_FLOW_ESWITCH	= BIT(MLX5E_TC_FLOW_BASE),
-	MLX5E_TC_FLOW_NIC	= BIT(MLX5E_TC_FLOW_BASE + 1),
-	MLX5E_TC_FLOW_OFFLOADED	= BIT(MLX5E_TC_FLOW_BASE + 2),
-	MLX5E_TC_FLOW_HAIRPIN	= BIT(MLX5E_TC_FLOW_BASE + 3),
-	MLX5E_TC_FLOW_HAIRPIN_RSS = BIT(MLX5E_TC_FLOW_BASE + 4),
-	MLX5E_TC_FLOW_SLOW	  = BIT(MLX5E_TC_FLOW_BASE + 5),
+
+	MLX5E_TC_FLOW_ESWITCH	= MLX5E_TC_ESW_OFFLOAD,
+	MLX5E_TC_FLOW_NIC	= MLX5E_TC_NIC_OFFLOAD,
+	MLX5E_TC_FLOW_OFFLOADED	= BIT(MLX5E_TC_FLOW_BASE),
+	MLX5E_TC_FLOW_HAIRPIN	= BIT(MLX5E_TC_FLOW_BASE + 1),
+	MLX5E_TC_FLOW_HAIRPIN_RSS = BIT(MLX5E_TC_FLOW_BASE + 2),
+	MLX5E_TC_FLOW_SLOW	  = BIT(MLX5E_TC_FLOW_BASE + 3),
+
 	MLX5E_TC_FLOW_INIT_DONE	= BIT(MLX5E_TC_FLOW_BASE + 6),
 	MLX5E_TC_FLOW_SIMPLE    = BIT(MLX5E_TC_FLOW_BASE + 7),
 	MLX5E_TC_FLOW_CT    = BIT(MLX5E_TC_FLOW_BASE + 8),
@@ -198,6 +200,7 @@ struct mlx5e_miniflow {
 	struct mlx5e_ct_tuple ct_tuples[MINIFLOW_MAX_CT_TUPLES];
 
 	struct mlx5e_miniflow_node mnodes[MINIFLOW_MAX_FLOWS];
+	int flags;
 };
 
 static const struct rhashtable_params mf_ht_params = {
@@ -1120,7 +1123,7 @@ static void mlx5e_tc_del_nic_flow(struct mlx5e_priv *priv,
 	mlx5_fc_destroy(priv->mdev, counter);
 
 	mutex_lock(&priv->fs.tc.t_lock);
-	if (!mlx5e_tc_num_filters(priv) && priv->fs.tc.t) {
+	if (!mlx5e_tc_num_filters(priv, MLX5E_TC_NIC_OFFLOAD)  && priv->fs.tc.t) {
 		mlx5_destroy_flow_table(priv->fs.tc.t);
 		priv->fs.tc.t = NULL;
 	}
@@ -3709,6 +3712,11 @@ static void get_flags(int flags, int *flow_flags)
 	if (flags & MLX5E_TC_EGRESS)
 		__flow_flags |= MLX5E_TC_FLOW_EGRESS;
 
+	if (flags & MLX5E_TC_ESW_OFFLOAD)
+		__flow_flags |= MLX5E_TC_FLOW_ESWITCH;
+	if (flags & MLX5E_TC_NIC_OFFLOAD)
+		__flow_flags |= MLX5E_TC_FLOW_NIC;
+
 	*flow_flags = __flow_flags;
 }
 
@@ -3719,15 +3727,15 @@ static const struct rhashtable_params tc_ht_params = {
 	.automatic_shrinking = true,
 };
 
-static struct rhashtable *get_tc_ht(struct mlx5e_priv *priv)
+static struct rhashtable *get_tc_ht(struct mlx5e_priv *priv, int flags)
 {
 	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
 	struct mlx5e_rep_priv *uplink_rpriv;
 
-	if (MLX5_VPORT_MANAGER(priv->mdev) && esw->mode == SRIOV_OFFLOADS) {
+	if (flags & MLX5E_TC_ESW_OFFLOAD) {
 		uplink_rpriv = mlx5_eswitch_get_uplink_priv(esw, REP_ETH);
 		return &uplink_rpriv->tc_ht;
-	} else
+	} else /* NIC offload */
 		return &priv->fs.tc.ht;
 }
 
@@ -3946,7 +3954,7 @@ int mlx5e_configure_flower(struct mlx5e_priv *priv,
 			   struct tc_cls_flower_offload *f, int flags)
 {
 	struct netlink_ext_ack *extack = f->common.extack;
-	struct rhashtable *tc_ht = get_tc_ht(priv);
+	struct rhashtable *tc_ht = get_tc_ht(priv, flags);
 	struct mlx5e_tc_flow *flow;
 	int err = 0;
 
@@ -4367,7 +4375,7 @@ static struct mlx5e_tc_flow *miniflow_ct_flow_alloc(struct mlx5e_priv *priv,
 static int miniflow_resolve_path_flows(struct mlx5e_miniflow *miniflow)
 {
 	struct mlx5e_priv *priv = miniflow->priv;
-	struct rhashtable *tc_ht = get_tc_ht(priv);
+	struct rhashtable *tc_ht = get_tc_ht(priv, miniflow->flags);
 	struct mlx5e_tc_flow *flow;
 	unsigned long cookie;
 	int i, j;
@@ -4390,7 +4398,7 @@ static int miniflow_resolve_path_flows(struct mlx5e_miniflow *miniflow)
 static int miniflow_verify_path_flows(struct mlx5e_miniflow *miniflow)
 {
 	struct mlx5e_priv *priv = miniflow->priv;
-	struct rhashtable *tc_ht = get_tc_ht(priv);
+	struct rhashtable *tc_ht = get_tc_ht(priv, miniflow->flags);
 	struct mlx5e_tc_flow *flow;
 	unsigned long cookie;
 	int i;
@@ -4554,7 +4562,7 @@ static struct mlx5e_ct_tuple *miniflow_ct_tuple_alloc(struct mlx5e_miniflow *min
 /* TODO: bug: ct_flow is not stored in tc_ht, memory leak on cleanup if any is still offloaded */
 /* Future patch should have a list of ct_flow to free on cleanup */
 int mlx5e_configure_ct(struct mlx5e_priv *priv,
-		       struct tc_ct_offload *cto)
+		       struct tc_ct_offload *cto, int flag)
 {
 	struct mlx5e_miniflow *miniflow;
 	struct sk_buff *skb = cto->skb;
@@ -4668,7 +4676,7 @@ err:
 }
 
 int mlx5e_configure_miniflow(struct mlx5e_priv *priv,
-			      struct tc_miniflow_offload *mf)
+			      struct tc_miniflow_offload *mf, int flags)
 {
 	struct rhashtable *mf_ht = get_mf_ht(priv);
 	struct sk_buff *skb = mf->skb;
@@ -4687,6 +4695,8 @@ int mlx5e_configure_miniflow(struct mlx5e_priv *priv,
 
 	if ((miniflow->cookie != (u64) skb)||(0 == mf->chain_index))
 		miniflow_init(miniflow, priv, skb);
+
+	miniflow->flags = flags;
 
 	if (miniflow->nr_flows == -1)
 		goto err;
@@ -4757,7 +4767,7 @@ static bool same_flow_direction(struct mlx5e_tc_flow *flow, int flags)
 int mlx5e_delete_flower(struct mlx5e_priv *priv,
 			struct tc_cls_flower_offload *f, int flags)
 {
-	struct rhashtable *tc_ht = get_tc_ht(priv);
+	struct rhashtable *tc_ht = get_tc_ht(priv, flags);
 	struct mlx5e_tc_flow *flow;
 
 	/* TODO: not sure this is a must */
@@ -4785,7 +4795,7 @@ int mlx5e_delete_flower(struct mlx5e_priv *priv,
 int mlx5e_stats_flower(struct mlx5e_priv *priv,
 		       struct tc_cls_flower_offload *f, int flags)
 {
-	struct rhashtable *tc_ht = get_tc_ht(priv);
+	struct rhashtable *tc_ht = get_tc_ht(priv, flags);
 	struct mlx5e_tc_flow *flow;
 	struct mlx5_fc *counter;
 	int err = 0;
@@ -4909,7 +4919,7 @@ void mlx5e_tc_nic_cleanup(struct mlx5e_priv *priv)
 	if (tc->netdevice_nb.notifier_call)
 		unregister_netdevice_notifier(&tc->netdevice_nb);
 
-	rhashtable_free_and_destroy(&tc->ht, _mlx5e_tc_del_flow, NULL);
+	rhashtable_destroy(&tc->ht);
 
 	if (!IS_ERR_OR_NULL(tc->t)) {
 		mlx5_destroy_flow_table(tc->t);
@@ -4975,9 +4985,9 @@ struct flow_offload_dep_ops ct_offload_ops = {
 	.destroy = ct_flow_offload_destroy
 };
 
-int mlx5e_tc_esw_init(struct mlx5e_priv *priv)
+int mlx5e_tc_esw_init(struct mlx5e_priv *priv, int flags)
 {
-	struct rhashtable *tc_ht = get_tc_ht(priv);
+	struct rhashtable *tc_ht = get_tc_ht(priv, flags);
 	struct rhashtable *mf_ht = get_mf_ht(priv);
 	int err;
 
@@ -5019,9 +5029,9 @@ err_tc_ht:
 	return err;
 }
 
-void mlx5e_tc_esw_cleanup(struct mlx5e_priv *priv)
+void mlx5e_tc_esw_cleanup(struct mlx5e_priv *priv, int flags)
 {
-	struct rhashtable *tc_ht = get_tc_ht(priv);
+	struct rhashtable *tc_ht = get_tc_ht(priv, flags);
 	struct rhashtable *mf_ht = get_mf_ht(priv);
 	int cpu;
 
@@ -5043,9 +5053,9 @@ void mlx5e_tc_esw_cleanup(struct mlx5e_priv *priv)
 	miniflow_cache_allocated = 0;
 }
 
-int mlx5e_tc_num_filters(struct mlx5e_priv *priv)
+int mlx5e_tc_num_filters(struct mlx5e_priv *priv, int flags)
 {
-	struct rhashtable *tc_ht = get_tc_ht(priv);
+	struct rhashtable *tc_ht = get_tc_ht(priv, flags);
 
 	return atomic_read(&tc_ht->nelems);
 }
