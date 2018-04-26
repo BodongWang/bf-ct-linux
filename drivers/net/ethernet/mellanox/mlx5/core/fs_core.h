@@ -164,6 +164,10 @@ struct mlx5_fc {
 
 	u32 id;
 	bool aging;
+	bool dummy;
+
+	int nf_dummies;
+	struct mlx5_fc **dummies;
 
 	struct mlx5_fc_cache cache ____cacheline_aligned_in_smp;
 };
