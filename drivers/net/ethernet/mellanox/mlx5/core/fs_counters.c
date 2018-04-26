@@ -111,6 +111,21 @@ static void mlx5_fc_stats_remove(struct mlx5_core_dev *dev,
 	spin_unlock(&fc_stats->counters_idr_lock);
 }
 
+static void fc_dummies_update(struct mlx5_fc *counter,
+			      u64 dfpackets, u64 dfbytes, u64 jiffies)
+{
+	int i;
+
+	for (i = 0; i < counter->nf_dummies; i++) {
+		struct mlx5_fc *s = counter->dummies[i];
+		struct mlx5_fc_cache *c = &s->cache;
+
+		c->packets += dfpackets;
+		c->bytes += dfbytes;
+		c->lastuse = jiffies;
+	}
+}
+
 /* The function returns the last counter that was queried so the caller
  * function can continue calling it till all counters are queried.
  */
@@ -154,8 +169,8 @@ static struct mlx5_fc *mlx5_fc_stats_query(struct mlx5_core_dev *dev,
 	counter = first;
 	list_for_each_entry_from(counter, &fc_stats->counters, list) {
 		struct mlx5_fc_cache *c = &counter->cache;
-		u64 packets;
-		u64 bytes;
+		u64 packets, dfpackets;
+		u64 bytes, dfbytes;
 
 		if (counter->id > last_id) {
 			more = true;
@@ -168,9 +183,14 @@ static struct mlx5_fc *mlx5_fc_stats_query(struct mlx5_core_dev *dev,
 		if (c->packets == packets)
 			continue;
 
+		dfpackets = packets - c->packets;
+		dfbytes = bytes - c->bytes;
+
 		c->packets = packets;
 		c->bytes = bytes;
 		c->lastuse = jiffies;
+
+		fc_dummies_update(counter, dfpackets, dfbytes, jiffies);
 	}
 
 out:
@@ -182,7 +202,8 @@ out:
 static void mlx5_free_fc(struct mlx5_core_dev *dev,
 			 struct mlx5_fc *counter)
 {
-	mlx5_cmd_fc_free(dev, counter->id);
+	if (!counter->dummy) {
+		mlx5_cmd_fc_free(dev, counter->id);
 	kfree(counter);
 }
 
@@ -278,6 +299,20 @@ u32 mlx5_fc_id(struct mlx5_fc *counter)
 	return counter->id;
 }
 EXPORT_SYMBOL(mlx5_fc_id);
+
+void mlx5_fc_link_dummies(struct mlx5_fc *counter, struct mlx5_fc **dummies, int nf_dummies)
+{
+	/* TODO: use memory barrier, is the following correct? */
+	WRITE_ONCE(counter->dummies, dummies);
+	WRITE_ONCE(counter->nf_dummies, nf_dummies);
+}
+
+void mlx5_fc_unlink_dummies(struct mlx5_fc *counter)
+{
+	WRITE_ONCE(counter->nf_dummies, 0);
+	smp_wmb();
+	WRITE_ONCE(counter->dummies, NULL);
+}
 
 void mlx5_fc_destroy(struct mlx5_core_dev *dev, struct mlx5_fc *counter)
 {
