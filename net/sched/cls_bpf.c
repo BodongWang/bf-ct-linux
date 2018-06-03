@@ -166,18 +166,23 @@ static int cls_bpf_offload_cmd(struct tcf_proto *tp, struct cls_bpf_prog *prog,
 	cls_bpf.name = obj->bpf_name;
 	cls_bpf.exts_integrated = obj->exts_integrated;
 
+	if (prog)
+		err = tc_setup_cb_call(block, NULL, TC_SETUP_CLSBPF, &cls_bpf,
+				       skip_sw, true, &prog->gen_flags, NULL,
+				       TC_BLOCK_OFFLOADCNT_INC);
+	else
+		err = tc_setup_cb_call(block, NULL, TC_SETUP_CLSBPF, &cls_bpf,
+				       skip_sw, true, NULL, NULL,
+				       TC_BLOCK_OFFLOADCNT_NOOP);
+
 	if (oldprog)
 		tcf_block_offload_dec(block, &oldprog->gen_flags);
-
-	err = tc_setup_cb_call(block, NULL, TC_SETUP_CLSBPF, &cls_bpf, skip_sw,
-			       true);
 	if (prog) {
 		if (err < 0) {
 			cls_bpf_offload_cmd(tp, oldprog, prog, extack);
 			return err;
 		} else if (err > 0) {
 			prog->in_hw_count = err;
-			tcf_block_offload_inc(block, &prog->gen_flags);
 		}
 	}
 
@@ -235,7 +240,8 @@ static void cls_bpf_offload_update_stats(struct tcf_proto *tp,
 	cls_bpf.name = prog->bpf_name;
 	cls_bpf.exts_integrated = prog->exts_integrated;
 
-	tc_setup_cb_call(block, NULL, TC_SETUP_CLSBPF, &cls_bpf, false, true);
+	tc_setup_cb_call(block, NULL, TC_SETUP_CLSBPF, &cls_bpf, false, true,
+			 NULL, NULL, TC_BLOCK_OFFLOADCNT_NOOP);
 }
 
 static int cls_bpf_init(struct tcf_proto *tp)

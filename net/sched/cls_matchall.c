@@ -72,8 +72,7 @@ static void mall_destroy_hw_filter(struct tcf_proto *tp,
 	cls_mall.cookie = cookie;
 
 	tc_setup_cb_call(block, NULL, TC_SETUP_CLSMATCHALL, &cls_mall, false,
-			 true);
-	tcf_block_offload_dec(block, &head->flags);
+			 true, &head->flags, NULL, TC_BLOCK_OFFLOADCNT_DEC);
 }
 
 static int mall_replace_hw_filter(struct tcf_proto *tp,
@@ -92,13 +91,13 @@ static int mall_replace_hw_filter(struct tcf_proto *tp,
 	cls_mall.cookie = cookie;
 
 	err = tc_setup_cb_call(block, NULL, TC_SETUP_CLSMATCHALL,
-			       &cls_mall, skip_sw, true);
+			       &cls_mall, skip_sw, true, &head->flags, NULL,
+			       TC_BLOCK_OFFLOADCNT_INC);
 	if (err < 0) {
 		mall_destroy_hw_filter(tp, head, cookie, NULL);
 		return err;
 	} else if (err > 0) {
 		head->in_hw_count = err;
-		tcf_block_offload_inc(block, &head->flags);
 	}
 
 	if (skip_sw && !(head->flags & TCA_CLS_FLAGS_IN_HW))

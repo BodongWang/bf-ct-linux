@@ -492,7 +492,7 @@ static void u32_clear_hw_hnode(struct tcf_proto *tp, struct tc_u_hnode *h,
 	cls_u32.hnode.prio = h->prio;
 
 	tc_setup_cb_call(block, NULL, TC_SETUP_CLSU32, &cls_u32, false,
-			 true);
+			 true, NULL, NULL, TC_BLOCK_OFFLOADCNT_NOOP);
 }
 
 static int u32_replace_hw_hnode(struct tcf_proto *tp, struct tc_u_hnode *h,
@@ -511,7 +511,7 @@ static int u32_replace_hw_hnode(struct tcf_proto *tp, struct tc_u_hnode *h,
 	cls_u32.hnode.prio = h->prio;
 
 	err = tc_setup_cb_call(block, NULL, TC_SETUP_CLSU32, &cls_u32, skip_sw,
-			       true);
+			       true, NULL, NULL, TC_BLOCK_OFFLOADCNT_NOOP);
 	if (err < 0) {
 		u32_clear_hw_hnode(tp, h, NULL);
 		return err;
@@ -536,8 +536,7 @@ static void u32_remove_hw_knode(struct tcf_proto *tp, struct tc_u_knode *n,
 	cls_u32.knode.handle = n->handle;
 
 	tc_setup_cb_call(block, NULL, TC_SETUP_CLSU32, &cls_u32, false,
-			 true);
-	tcf_block_offload_dec(block, &n->flags);
+			 true, &n->flags, NULL, TC_BLOCK_OFFLOADCNT_DEC);
 }
 
 static int u32_replace_hw_knode(struct tcf_proto *tp, struct tc_u_knode *n,
@@ -566,13 +565,12 @@ static int u32_replace_hw_knode(struct tcf_proto *tp, struct tc_u_knode *n,
 		cls_u32.knode.link_handle = ht->handle;
 
 	err = tc_setup_cb_call(block, NULL, TC_SETUP_CLSU32, &cls_u32, skip_sw,
-			       true);
+			       true, &n->flags, NULL, TC_BLOCK_OFFLOADCNT_INC);
 	if (err < 0) {
 		u32_remove_hw_knode(tp, n, NULL);
 		return err;
 	} else if (err > 0) {
 		n->in_hw_count = err;
-		tcf_block_offload_inc(block, &n->flags);
 	}
 
 	if (skip_sw && !(n->flags & TCA_CLS_FLAGS_IN_HW))
