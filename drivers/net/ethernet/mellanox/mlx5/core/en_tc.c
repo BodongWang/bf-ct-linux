@@ -3293,9 +3293,15 @@ static int parse_tc_fdb_actions(struct mlx5e_priv *priv, struct tcf_exts *exts,
 			struct mlx5e_priv *out_priv;
 			struct net_device *out_dev;
 
-			out_dev = tcf_mirred_dev(a);
+			rcu_read_lock();
+			out_dev = tcf_mirred_dev_rcu(a);
+			if (out_dev)
+				dev_hold(out_dev);
+			rcu_read_unlock();
 
 			if (attr->out_count >= MLX5_MAX_FLOW_FWD_VPORTS) {
+				if (out_dev)
+					dev_put(out_dev);
 				NL_SET_ERR_MSG_MOD(extack,
 						   "can't support more output ports, can't offload forwarding");
 				pr_err("can't support more than %d output ports, can't offload forwarding\n",
@@ -3325,8 +3331,12 @@ static int parse_tc_fdb_actions(struct mlx5e_priv *priv, struct tcf_exts *exts,
 						   "devices are not on same switch HW, can't offload forwarding");
 				pr_err("devices %s %s not on same switch HW, can't offload forwarding\n",
 				       priv->netdev->name, out_dev->name);
+				if (out_dev)
+					dev_put(out_dev);
 				return -EINVAL;
 			}
+			if (out_dev)
+				dev_put(out_dev);
 			continue;
 		}
 
