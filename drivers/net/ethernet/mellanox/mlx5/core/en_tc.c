@@ -76,6 +76,7 @@ enum {
 	MLX5E_TC_FLOW_HAIRPIN	= BIT(MLX5E_TC_FLOW_BASE + 3),
 	MLX5E_TC_FLOW_HAIRPIN_RSS = BIT(MLX5E_TC_FLOW_BASE + 4),
 	MLX5E_TC_FLOW_SLOW	  = BIT(MLX5E_TC_FLOW_BASE + 5),
+	MLX5E_TC_FLOW_INIT_DONE	= BIT(MLX5E_TC_FLOW_BASE + 6),
 };
 
 #define MLX5E_TC_MAX_SPLITS 1
@@ -1158,7 +1159,7 @@ static void mlx5e_tc_del_fdb_flow(struct mlx5e_priv *priv,
 }
 
 void mlx5e_tc_encap_flows_add(struct mlx5e_priv *priv,
-			      struct mlx5e_encap_entry *e)
+			      struct mlx5e_encap_entry *e, bool *resched_update)
 {
 	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
 	struct mlx5_esw_flow_attr slow_attr, *esw_attr;
@@ -1187,6 +1188,15 @@ void mlx5e_tc_encap_flows_add(struct mlx5e_priv *priv,
 		if (IS_ERR(mlx5e_flow_get(flow)))
 			continue;
 
+		/* Can't offload encap when flow is being initialized
+		 * concurrently without encap_id set. Schedule another neigh
+		 * update for later.
+		 */
+		if (!(atomic_read(&flow->flags) & MLX5E_TC_FLOW_INIT_DONE)) {
+			*resched_update = true;
+			goto loop_cont;
+		}
+
 		esw_attr = flow->esw_attr;
 		esw_attr->encap_id = e->encap_id;
 		spec = &esw_attr->parse_attr->spec;
@@ -1214,13 +1224,15 @@ loop_cont:
 }
 
 void mlx5e_tc_encap_flows_del(struct mlx5e_priv *priv,
-			      struct mlx5e_encap_entry *e)
+			      struct mlx5e_encap_entry *e,
+			      bool *resched_update)
 {
 	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
 	struct mlx5_esw_flow_attr slow_attr;
 	struct mlx5e_tc_flow *flow, *tmp;
 	struct mlx5_flow_handle *rule;
 	struct mlx5_flow_spec *spec;
+	bool can_dealloc = true;
 	int err;
 
 	/* Caller holds rtnl and reference to encap entry, so it is not possible
@@ -1238,6 +1250,15 @@ void mlx5e_tc_encap_flows_del(struct mlx5e_priv *priv,
 	list_for_each_entry_safe(flow, tmp, &e->offloaded_flows, encap) {
 		if (IS_ERR(mlx5e_flow_get(flow)))
 			continue;
+
+		/* Can't delete encap when flow is being initialized
+		 * concurrently with encap_id set. Schedule another neigh update
+		 * for later.
+		 */
+		if (!(atomic_read(&flow->flags) & MLX5E_TC_FLOW_INIT_DONE)) {
+			can_dealloc = false;
+			goto loop_cont;
+		}
 
 		spec = &flow->esw_attr->parse_attr->spec;
 
@@ -1269,7 +1290,7 @@ loop_cont:
 	/* Caller holds rtnl and reference to encap entry, so it is not possible
 	 * for flags to be changed concurrently.
 	 */
-	if (e->flags & MLX5_ENCAP_ENTRY_OFFLOADED) {
+	if (can_dealloc && (e->flags & MLX5_ENCAP_ENTRY_OFFLOADED)) {
 		spin_lock(&e->encap_entry_lock);
 		e->flags &= ~MLX5_ENCAP_ENTRY_OFFLOADED;
 		spin_unlock(&e->encap_entry_lock);
@@ -1279,6 +1300,9 @@ loop_cont:
 		 */
 		mlx5_packet_reformat_dealloc(priv->mdev, e->encap_id);
 	}
+
+	/* Schedule another update if encap wasn't deallocated. */
+	*resched_update = *resched_update || !can_dealloc;
 }
 
 static struct mlx5_fc *mlx5e_tc_get_counter(struct mlx5e_tc_flow *flow)
@@ -3581,6 +3605,8 @@ int mlx5e_configure_flower(struct mlx5e_priv *priv,
 	if (err)
 		goto err_free;
 
+	atomic_or(MLX5E_TC_FLOW_INIT_DONE, &flow->flags);
+
 	return 0;
 
 err_free:
@@ -3640,7 +3666,8 @@ int mlx5e_stats_flower(struct mlx5e_priv *priv,
 	rcu_read_unlock();
 	if (IS_ERR(flow)) {
 		return PTR_ERR(flow);
-	} else if (!same_flow_direction(flow, flags)) {
+	} else if (!same_flow_direction(flow, flags) ||
+		   !(atomic_read(&flow->flags) & MLX5E_TC_FLOW_INIT_DONE)) {
 		err = -EINVAL;
 		goto errout;
 	}
