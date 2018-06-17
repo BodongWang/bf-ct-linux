@@ -1158,6 +1158,38 @@ static void mlx5e_tc_del_fdb_flow(struct mlx5e_priv *priv,
 		mlx5_fc_destroy(esw->dev, attr->counter);
 }
 
+static void mlx5e_tc_encap_flows_get(struct mlx5e_encap_entry *e,
+				     struct list_head *flows)
+{
+	struct mlx5e_tc_flow *flow;
+
+	list_for_each_entry(flow, flows, encap)
+		mlx5e_flow_get(flow);
+}
+
+void mlx5e_tc_encap_flows_get_offloaded(struct mlx5e_encap_entry *e)
+{
+	spin_lock(&e->encap_entry_lock);
+	/* Reset VALID flag so that any concurrently created flows will
+	 * be inserted to waiting list.
+	 */
+	e->flags &= ~MLX5_ENCAP_ENTRY_VALID;
+	e->flags |= MLX5_ENCAP_ENTRY_DEL_PENDING;
+	mlx5e_tc_encap_flows_get(e, &e->offloaded_flows);
+	spin_unlock(&e->encap_entry_lock);
+}
+
+void mlx5e_tc_encap_flows_get_waiting(struct mlx5e_encap_entry *e)
+{
+	spin_lock(&e->encap_entry_lock);
+	/* Set VALID flag so that any concurrently created flows will be
+	 * inserted to offloaded list.
+	 */
+	e->flags |= MLX5_ENCAP_ENTRY_VALID | MLX5_ENCAP_ENTRY_CREATE_PENDING;
+	mlx5e_tc_encap_flows_get(e, &e->waiting_flows);
+	spin_unlock(&e->encap_entry_lock);
+}
+
 void mlx5e_tc_encap_flows_add(struct mlx5e_priv *priv,
 			      struct mlx5e_encap_entry *e, bool *resched_update)
 {
@@ -1169,32 +1201,31 @@ void mlx5e_tc_encap_flows_add(struct mlx5e_priv *priv,
 	u32 encap_id;
 	int err;
 
-	err = mlx5_packet_reformat_alloc(priv->mdev, e->tunnel_type,
-					 e->encap_size, e->encap_header,
-					 MLX5_FLOW_NAMESPACE_FDB,
-					 &encap_id);
-	if (err) {
-		mlx5_core_warn(priv->mdev, "Failed to offload cached encapsulation header, %d\n",
-			       err);
-		return;
+	if (!(e->flags & MLX5_ENCAP_ENTRY_OFFLOADED)) {
+		err = mlx5_packet_reformat_alloc(priv->mdev, e->tunnel_type,
+						 e->encap_size, e->encap_header,
+						 MLX5_FLOW_NAMESPACE_FDB,
+						 &encap_id);
+		if (err) {
+			mlx5_core_warn(priv->mdev, "Failed to offload cached encapsulation header, %d\n",
+				       err);
+			return;
+		}
+		spin_lock(&e->encap_entry_lock);
+		e->encap_id = encap_id;
+		e->flags |= MLX5_ENCAP_ENTRY_OFFLOADED;
+		spin_unlock(&e->encap_entry_lock);
 	}
-	spin_lock(&e->encap_entry_lock);
-	e->encap_id = encap_id;
-	e->flags |= MLX5_ENCAP_ENTRY_VALID | MLX5_ENCAP_ENTRY_OFFLOADED;
-	spin_unlock(&e->encap_entry_lock);
 	mlx5e_rep_queue_neigh_stats_work(priv);
 
 	list_for_each_entry_safe(flow, tmp, &e->waiting_flows, encap) {
-		if (IS_ERR(mlx5e_flow_get(flow)))
-			continue;
-
 		/* Can't offload encap when flow is being initialized
 		 * concurrently without encap_id set. Schedule another neigh
 		 * update for later.
 		 */
 		if (!(atomic_read(&flow->flags) & MLX5E_TC_FLOW_INIT_DONE)) {
 			*resched_update = true;
-			goto loop_cont;
+			goto flow_put;
 		}
 
 		esw_attr = flow->esw_attr;
@@ -1207,7 +1238,7 @@ void mlx5e_tc_encap_flows_add(struct mlx5e_priv *priv,
 			err = PTR_ERR(rule);
 			mlx5_core_warn(priv->mdev, "Failed to update cached encapsulation flow, %d\n",
 				       err);
-			goto loop_cont;
+			goto flow_move;
 		}
 
 		mlx5e_tc_unoffload_from_slow_path(esw, flow, &slow_attr);
@@ -1215,10 +1246,11 @@ void mlx5e_tc_encap_flows_add(struct mlx5e_priv *priv,
 		atomic_or(MLX5E_TC_FLOW_OFFLOADED, &flow->flags);
 		flow->rule[0] = rule;
 
+flow_move:
 		spin_lock(&e->encap_entry_lock);
 		list_move(&flow->encap, &e->offloaded_flows);
 		spin_unlock(&e->encap_entry_lock);
-loop_cont:
+flow_put:
 		mlx5e_flow_put(priv, flow);
 	}
 }
@@ -1235,29 +1267,14 @@ void mlx5e_tc_encap_flows_del(struct mlx5e_priv *priv,
 	bool can_dealloc = true;
 	int err;
 
-	/* Caller holds rtnl and reference to encap entry, so it is not possible
-	 * for flags to be changed concurrently.
-	 */
-	if (e->flags & MLX5_ENCAP_ENTRY_VALID) {
-		/* Reset VALID flag so that any concurrently created flows will
-		 * be inserted to waiting list.
-		 */
-		spin_lock(&e->encap_entry_lock);
-		e->flags &= ~MLX5_ENCAP_ENTRY_VALID;
-		spin_unlock(&e->encap_entry_lock);
-	}
-
 	list_for_each_entry_safe(flow, tmp, &e->offloaded_flows, encap) {
-		if (IS_ERR(mlx5e_flow_get(flow)))
-			continue;
-
 		/* Can't delete encap when flow is being initialized
 		 * concurrently with encap_id set. Schedule another neigh update
 		 * for later.
 		 */
 		if (!(atomic_read(&flow->flags) & MLX5E_TC_FLOW_INIT_DONE)) {
 			can_dealloc = false;
-			goto loop_cont;
+			goto flow_put;
 		}
 
 		spec = &flow->esw_attr->parse_attr->spec;
@@ -1269,7 +1286,7 @@ void mlx5e_tc_encap_flows_del(struct mlx5e_priv *priv,
 			err = PTR_ERR(rule);
 			mlx5_core_warn(priv->mdev, "Failed to update slow path (encap) flow, %d\n",
 				       err);
-			goto loop_cont;
+			goto flow_move;
 		}
 
 		mlx5e_tc_unoffload_fdb_rules(esw, flow, flow->esw_attr);
@@ -1277,13 +1294,14 @@ void mlx5e_tc_encap_flows_del(struct mlx5e_priv *priv,
 		atomic_or(MLX5E_TC_FLOW_OFFLOADED, &flow->flags);
 		flow->rule[0] = rule;
 
+flow_move:
 		/* Move flow to list of flows waiting for neigh to become
 		 * valid.
 		 */
 		spin_lock(&e->encap_entry_lock);
 		list_move(&flow->encap, &e->waiting_flows);
 		spin_unlock(&e->encap_entry_lock);
-loop_cont:
+flow_put:
 		mlx5e_flow_put(priv, flow);
 	}
 
