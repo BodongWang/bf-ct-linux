@@ -882,7 +882,7 @@ mlx5e_tc_add_fdb_flow(struct mlx5e_priv *priv,
 	return rule;
 
 err_fwd_rule:
-	mlx5_eswitch_del_offloaded_rule(esw, rule, attr);
+	mlx5_eswitch_del_offloaded_rule(esw, rule, attr, false);
 	rule = flow->rule[1];
 err_add_rule:
 	if (attr->action & MLX5_FLOW_CONTEXT_ACTION_MOD_HDR)
@@ -905,8 +905,8 @@ static void mlx5e_tc_del_fdb_flow(struct mlx5e_priv *priv,
 	if (flow->flags & MLX5E_TC_FLOW_OFFLOADED) {
 		flow->flags &= ~MLX5E_TC_FLOW_OFFLOADED;
 		if (attr->mirror_count)
-			mlx5_eswitch_del_offloaded_rule(esw, flow->rule[1], attr);
-		mlx5_eswitch_del_offloaded_rule(esw, flow->rule[0], attr);
+			mlx5_eswitch_del_offloaded_rule(esw, flow->rule[1], attr, true);
+		mlx5_eswitch_del_offloaded_rule(esw, flow->rule[0], attr, false);
 	}
 
 	mlx5_eswitch_del_vlan_action(esw, attr);
@@ -953,7 +953,10 @@ void mlx5e_tc_encap_flows_add(struct mlx5e_priv *priv,
 		if (esw_attr->mirror_count) {
 			flow->rule[1] = mlx5_eswitch_add_fwd_rule(esw, &esw_attr->parse_attr->spec, esw_attr);
 			if (IS_ERR(flow->rule[1])) {
-				mlx5_eswitch_del_offloaded_rule(esw, flow->rule[0], esw_attr);
+				mlx5_eswitch_del_offloaded_rule(esw,
+								flow->rule[0],
+								esw_attr,
+								false);
 				err = PTR_ERR(flow->rule[1]);
 				mlx5_core_warn(priv->mdev, "Failed to update cached mirror flow, %d\n",
 					       err);
@@ -977,8 +980,14 @@ void mlx5e_tc_encap_flows_del(struct mlx5e_priv *priv,
 
 			flow->flags &= ~MLX5E_TC_FLOW_OFFLOADED;
 			if (attr->mirror_count)
-				mlx5_eswitch_del_offloaded_rule(esw, flow->rule[1], attr);
-			mlx5_eswitch_del_offloaded_rule(esw, flow->rule[0], attr);
+				mlx5_eswitch_del_offloaded_rule(esw,
+								flow->rule[1],
+								attr,
+								true);
+			mlx5_eswitch_del_offloaded_rule(esw,
+							flow->rule[0],
+							attr,
+							false);
 		}
 	}
 
