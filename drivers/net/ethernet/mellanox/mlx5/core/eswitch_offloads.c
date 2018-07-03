@@ -630,9 +630,10 @@ esw_get_prio_table(struct mlx5_eswitch *esw, u32 chain, u32 prio, bool fast)
 	u32 flags = 0;
 	bool created_fast_fdb = false;
 
-	prio = 1;
-	if (esw->fdb_fixed)
+	if (esw->fdb_fixed) {
 		chain = 0;
+		prio = 1;
+	}
 
 	if (prio > FDB_MAX_PRIO || chain > FDB_MAX_CHAIN) {
 		esw_warn(dev, "max chain or prio\n");
@@ -725,9 +726,10 @@ err_ns:
 static void
 esw_put_prio_table(struct mlx5_eswitch *esw, u32 chain, u32 prio, bool fast)
 {
-	prio = 1;
-	if (esw->fdb_fixed)
+	if (esw->fdb_fixed) {
 		chain = 0;
+		prio = 1;
+	}
 
 	if (prio > FDB_MAX_PRIO || chain > FDB_MAX_CHAIN)
 		return;

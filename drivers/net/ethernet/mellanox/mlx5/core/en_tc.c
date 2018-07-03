@@ -2536,6 +2536,7 @@ static int parse_tc_fdb_actions(struct mlx5e_priv *priv, struct tcf_exts *exts,
 				struct mlx5e_tc_flow_parse_attr *parse_attr,
 				struct mlx5e_tc_flow *flow)
 {
+	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
 	struct mlx5_esw_flow_attr *attr = flow->esw_attr;
 	struct mlx5e_rep_priv *rpriv = priv->ppriv;
 	struct ip_tunnel_info *info = NULL;
@@ -2653,6 +2654,26 @@ static int parse_tc_fdb_actions(struct mlx5e_priv *priv, struct tcf_exts *exts,
 			continue;
 		}
 
+		if (is_tcf_gact_goto_chain(a)) {
+			int chain = tcf_gact_goto_chain_index(a);
+			int max_chain = mlx5_eswitch_get_chain_range(esw);
+
+			if (chain == 0) {
+				netdev_warn_once(priv->netdev, "goto to earlier chain isn't supported.\n");
+				return -EOPNOTSUPP;
+			}
+			if (chain > max_chain) {
+				esw_warn(esw->dev, "Requested output chain %d is out of range (0-%d)\n",
+					 chain, max_chain);
+				return -EOPNOTSUPP;
+			}
+			action |= MLX5_FLOW_CONTEXT_ACTION_FWD_DEST |
+				  MLX5_FLOW_CONTEXT_ACTION_COUNT;
+			attr->dest_chain = chain;
+
+			continue;
+		}
+
 		return -EINVAL;
 	}
 
@@ -2707,9 +2728,28 @@ int mlx5e_configure_flower(struct mlx5e_priv *priv,
 	struct rhashtable *tc_ht = get_tc_ht(priv);
 	struct mlx5e_tc_flow *flow;
 	int attr_size, err = 0;
+	u32 max_chain = mlx5_eswitch_get_chain_range(esw);
+	u32 max_prio = mlx5_eswitch_get_prio_range(esw);
+	u32 chain = f->common.chain_index;
+	u32 prio = TC_H_MAJ(f->common.prio) >> 16;
 	u8 flow_flags = 0;
 
 	get_flags(flags, &flow_flags);
+
+	if (!tc_can_offload_extack(priv->netdev, f->common.extack))
+		return -EOPNOTSUPP;
+
+	if (chain > max_chain) {
+		esw_warn(esw->dev, "Requested input chain %d is out of range (0-%d)\n",
+			 chain, max_chain);
+		return -EOPNOTSUPP;
+	}
+
+	if (prio > max_prio) {
+		esw_warn(esw->dev, "Requested input prio %d is out of range (0-%d)\n",
+			 prio, max_prio);
+		return -EOPNOTSUPP;
+	}
 
 	flow = rhashtable_lookup_fast(tc_ht, &f->cookie, tc_ht_params);
 	if (flow) {
@@ -2741,6 +2781,8 @@ int mlx5e_configure_flower(struct mlx5e_priv *priv,
 		goto err_free;
 
 	if (flow->flags & MLX5E_TC_FLOW_ESWITCH) {
+		flow->esw_attr->chain = chain;
+		flow->esw_attr->prio = prio;
 		err = parse_tc_fdb_actions(priv, f->exts, parse_attr, flow);
 		if (err < 0)
 			goto err_free;
