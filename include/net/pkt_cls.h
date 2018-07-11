@@ -13,6 +13,7 @@ struct tcf_walker {
 	int	stop;
 	int	skip;
 	int	count;
+	unsigned long cookie;
 	int	(*fn)(struct tcf_proto *, void *node, struct tcf_walker *);
 };
 
@@ -731,6 +732,10 @@ struct tc_cls_flower_offload {
 	struct fl_flow_key *key;
 	struct tcf_exts *exts;
 	u32 classid;
+
+	/* FIXME: that's the right place? */
+	u8 ct_state_key;
+	u8 ct_state_mask;
 };
 
 enum tc_matchall_command {

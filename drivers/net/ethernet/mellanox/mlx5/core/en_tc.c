@@ -44,6 +44,7 @@
 #include <net/tc_act/tc_tunnel_key.h>
 #include <net/tc_act/tc_pedit.h>
 #include <net/tc_act/tc_csum.h>
+#include <net/tc_act/tc_ct.h>
 #include <net/vxlan.h>
 #include <net/arp.h>
 #include "en.h"
@@ -53,6 +54,15 @@
 #include "lib/vxlan.h"
 #include "fs_core.h"
 #include "en/port.h"
+
+#include <linux/yktrace.h>
+TRACE_ALL;
+
+static int num_of_hw_ct = 0;
+
+module_param(num_of_hw_ct, int, 0644);
+MODULE_PARM_DESC(num_of_hw_ct, "Number of tracked connections in hardware");
+
 
 struct mlx5_nic_flow_attr {
 	u32 action;
@@ -869,6 +879,16 @@ mlx5e_tc_add_fdb_flow(struct mlx5e_priv *priv,
 	 * (2) there's an encap action and we're on -EAGAIN (no valid neigh)
 	 */
 	if (rule != ERR_PTR(-EAGAIN)) {
+		attr->dest_chain = attr->dest_chain << 1;
+		attr->chain = attr->chain << 1;
+
+		if (attr->trk_est) {
+			attr->action = MLX5_FLOW_CONTEXT_ACTION_FWD_DEST |
+				       MLX5_FLOW_CONTEXT_ACTION_COUNT;
+			attr->dest_chain = attr->chain + 1;
+			trace("ct: +est+trk rule, fwd: %d -> %d", attr->chain, attr->dest_chain);
+		}
+
 		rule = mlx5_eswitch_add_offloaded_rule(esw, &parse_attr->spec, attr);
 		if (IS_ERR(rule))
 			goto err_add_rule;
@@ -896,11 +916,53 @@ err_attach_encap:
 	return rule;
 }
 
+struct ct_flow {
+	struct hlist_node hlist;
+	struct mlx5_flow_handle *rule;
+	u8 flags;
+	struct mlx5_esw_flow_attr esw_attr;
+
+	struct tc_tuple tuple;
+	unsigned long cookie;
+};
+
+static void mlx5e_clear_tuples_for_flow(struct mlx5e_priv *priv, struct mlx5e_tc_flow *flow) {
+	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
+	struct ct_flow *ct_flow = 0;
+	struct hlist_node *tmp;
+	int bkt = 0;
+
+	trace("[flow: %p, cookie: %p] clearing tuples for cookie: %p", flow, flow->cookie);
+
+	if (!(flow->flags & MLX5E_TC_FLOW_OFFLOADED))
+		return;
+
+	hash_for_each_safe(esw->offloads.ct_tbl, bkt, tmp, ct_flow, hlist) {
+		if (ct_flow->cookie == flow->cookie) {
+			if (ct_flow->flags & MLX5E_TC_FLOW_OFFLOADED) {
+				mlx5_eswitch_del_offloaded_rule(esw, ct_flow->rule, &ct_flow->esw_attr, false);
+
+				ct_flow->flags &= ~MLX5E_TC_FLOW_OFFLOADED;
+				--num_of_hw_ct;
+				trace("[flow: %p, cookie: %p] deleted tuple: %p", flow, flow->cookie, ct_flow);
+			} else {
+				trace("[flow: %p, cookie: %p] tuple: %p not offloaded", flow, flow->cookie, ct_flow);
+			}
+			hash_del(&ct_flow->hlist);
+
+			kfree(ct_flow);
+		}
+	}
+}
+
 static void mlx5e_tc_del_fdb_flow(struct mlx5e_priv *priv,
 				  struct mlx5e_tc_flow *flow)
 {
 	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
 	struct mlx5_esw_flow_attr *attr = flow->esw_attr;
+
+	trace("clearing tuples for flow: %p", flow);
+	mlx5e_clear_tuples_for_flow(priv, flow);
 
 	if (flow->flags & MLX5E_TC_FLOW_OFFLOADED) {
 		flow->flags &= ~MLX5E_TC_FLOW_OFFLOADED;
@@ -1576,6 +1638,17 @@ static int parse_cls_flower(struct mlx5e_priv *priv,
 	struct mlx5_eswitch_rep *rep;
 	u8 match_level;
 	int err;
+
+#define CT_STATE_MATCH(flags) ((f->ct_state_key & f->ct_state_mask) == (flags))
+
+	/* Allow only -trk and +trk+est only */
+	if (!(CT_STATE_MATCH(0) ||
+	      CT_STATE_MATCH(TCA_FLOWER_KEY_CT_FLAGS_TRACKED |
+			     TCA_FLOWER_KEY_CT_FLAGS_ESTABLISHED))) {
+		netdev_warn(priv->netdev, "Unsupported ct_state used: key/mask: %x/%x\n",
+			    f->ct_state_key, f->ct_state_mask);
+		return -EOPNOTSUPP;
+	}
 
 	err = __parse_cls_flower(priv, spec, f, &match_level);
 
@@ -2655,8 +2728,8 @@ static int parse_tc_fdb_actions(struct mlx5e_priv *priv, struct tcf_exts *exts,
 		}
 
 		if (is_tcf_gact_goto_chain(a)) {
-			int chain = tcf_gact_goto_chain_index(a);
-			int max_chain = mlx5_eswitch_get_chain_range(esw);
+			int chain = tcf_gact_goto_chain_index(a) & 0xFF;
+			u32 max_chain = mlx5_eswitch_get_chain_range(esw);
 
 			if (chain == 0) {
 				netdev_warn_once(priv->netdev, "goto to earlier chain isn't supported.\n");
@@ -2674,6 +2747,9 @@ static int parse_tc_fdb_actions(struct mlx5e_priv *priv, struct tcf_exts *exts,
 			continue;
 		}
 
+		if (is_tcf_ct(a))
+			continue;
+
 		return -EINVAL;
 	}
 
@@ -2685,6 +2761,8 @@ static int parse_tc_fdb_actions(struct mlx5e_priv *priv, struct tcf_exts *exts,
 		netdev_warn_once(priv->netdev, "current firmware doesn't support split rule for port mirroring\n");
 		return -EOPNOTSUPP;
 	}
+
+	attr->mirror_count = 0;
 
 	return 0;
 }
@@ -2720,6 +2798,168 @@ static struct rhashtable *get_tc_ht(struct mlx5e_priv *priv)
 		return &priv->fs.tc.ht;
 }
 
+/* should be called under rtnl lock */
+int mlx5e_configure_ct_5_tuple(struct mlx5e_priv *priv, struct tc_tuple_offload *tuple_cmd) {
+	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
+	struct tc_tuple *tuple = &tuple_cmd->tuple;
+	struct mlx5_flow_spec s, *spec = &s;
+	struct rhashtable *tc_ht = get_tc_ht(priv);
+	struct mlx5e_tc_flow *flow;
+	struct ct_flow *ct_flow = 0;
+	u32 hash_key = 0;
+	bool found = false;
+	int err;
+
+	trace("cookie: %p, cmd: %d", tuple_cmd->cookie, tuple_cmd->command);
+
+	flow = rhashtable_lookup_fast(tc_ht, &tuple_cmd->cookie, tc_ht_params);
+	if (!flow) {
+		etrace("flow for tuple not found, ignoring");
+		return 0;
+	}
+
+	trace("[flow: %p, cookie: %p] GOT 5tuple: (ethtype: %X) %d, IPs %d.%d.%d.%d, %d.%d.%d.%d ports %d, %d (cmd: %d)",
+			__FILE__, __LINE__, __func__, flow, flow->cookie,
+			tuple->etype,
+			tuple->ip_proto,
+			NIPQUAD(tuple->src_ipv4),
+			NIPQUAD(tuple->dst_ipv4),
+			ntohs(tuple->src_port),
+			ntohs(tuple->dst_port),
+			tuple_cmd->command);
+
+	hash_key = jhash(tuple, sizeof(*tuple), tuple_cmd->cookie);
+
+	hash_for_each_possible(esw->offloads.ct_tbl, ct_flow, hlist, hash_key) {
+		if (ct_flow->cookie == tuple_cmd->cookie
+		    && !memcmp(tuple, &ct_flow->tuple, sizeof(*tuple))) {
+			found = true;
+			break;
+		}
+	}
+
+	if (!found)
+		ct_flow = 0;
+
+	switch (tuple_cmd->command) {
+		case TC_CT_ADD: {
+			if (found && (ct_flow->flags & MLX5E_TC_FLOW_OFFLOADED)) {
+				trace("[flow: %p, cookie: %p] ADD ct flow %p already offloaded", flow, flow->cookie, ct_flow);
+				return 0;
+			}
+
+			if (!found) {
+				ct_flow = kzalloc(sizeof(*ct_flow), GFP_KERNEL);
+				if (!ct_flow)
+					return -1;
+
+				ct_flow->cookie = tuple_cmd->cookie;
+				ct_flow->tuple = *tuple;
+
+				memcpy(&ct_flow->esw_attr, flow->esw_attr, sizeof(ct_flow->esw_attr));
+				ct_flow->esw_attr.action = MLX5_FLOW_CONTEXT_ACTION_FWD_DEST;
+				ct_flow->esw_attr.dest_chain = 0;
+				ct_flow->esw_attr.chain = ct_flow->esw_attr.chain + 1;
+				ct_flow->esw_attr.prio = 1;
+				ct_flow->esw_attr.mirror_count = 0;
+				trace("[flow %p, cookie: %p] ADD creating ct flow %p tuple on chain %d",
+					flow, flow->cookie, ct_flow, ct_flow->esw_attr.chain);
+
+				hash_add(esw->offloads.ct_tbl, &ct_flow->hlist, hash_key);
+			}
+
+			memset(spec, 0, sizeof(struct mlx5_flow_spec));
+			spec->match_criteria_enable = MLX5_MATCH_OUTER_HEADERS;
+
+			MLX5_SET_TO_ONES(fte_match_param, spec->match_criteria,
+					outer_headers.ethertype);
+			MLX5_SET(fte_match_param, spec->match_value, outer_headers.ethertype,
+					ntohs(tuple->etype));
+
+			MLX5_SET_TO_ONES(fte_match_param, spec->match_criteria,
+					outer_headers.ip_protocol);
+			MLX5_SET(fte_match_param, spec->match_value, 
+					outer_headers.ip_protocol, tuple->ip_proto);
+
+			MLX5_SET_TO_ONES(fte_match_param, spec->match_criteria,
+					outer_headers.tcp_dport);
+			MLX5_SET_TO_ONES(fte_match_param, spec->match_criteria,
+					outer_headers.tcp_sport);
+
+			MLX5_SET(fte_match_param, spec->match_value, outer_headers.tcp_dport,
+					ntohs(tuple->dst_port));
+			MLX5_SET(fte_match_param, spec->match_value, outer_headers.tcp_sport,
+					ntohs(tuple->src_port));
+
+			if (tuple->ip_proto == IPPROTO_TCP) {
+				MLX5_SET_TO_ONES(fte_match_param, spec->match_criteria,
+						outer_headers.tcp_dport);
+				// FIN=1 SYN=2 RST=4 PSH=8 ACK=16 URG=32
+				MLX5_SET(fte_match_param, spec->match_criteria, outer_headers.tcp_flags,
+						0x17);
+				MLX5_SET(fte_match_param, spec->match_value, outer_headers.tcp_flags,
+						0x10);
+			}
+
+			if (tuple->etype == htons(ETH_P_IP)) {
+				memcpy(MLX5_ADDR_OF(fte_match_param, spec->match_value,
+							outer_headers.src_ipv4_src_ipv6.ipv4_layout.ipv4),
+						&tuple->src_ipv4,
+						4);
+				memcpy(MLX5_ADDR_OF(fte_match_param, spec->match_value,
+							outer_headers.dst_ipv4_dst_ipv6.ipv4_layout.ipv4),
+						&tuple->dst_ipv4,
+						4);
+
+				MLX5_SET_TO_ONES(fte_match_param, spec->match_criteria,
+						outer_headers.src_ipv4_src_ipv6.ipv4_layout.ipv4);
+				MLX5_SET_TO_ONES(fte_match_param, spec->match_criteria,
+						outer_headers.dst_ipv4_dst_ipv6.ipv4_layout.ipv4);
+			} else {
+				etrace("IPv6 is not supported yet");
+				return -EOPNOTSUPP;
+			}
+
+			ct_flow->rule = mlx5_eswitch_add_offloaded_rule(esw, spec, &ct_flow->esw_attr);
+			if (IS_ERR(flow->rule)) {
+				err = PTR_ERR(flow->rule);
+				etrace("Failed to offload tuple flow, %d", err);
+				return -1;
+			}
+
+			ct_flow->flags |= MLX5E_TC_FLOW_OFFLOADED;
+			++num_of_hw_ct;
+			trace("[flow: %p, cookie: %p] ADD offloaded ct flow: %p", flow, flow->cookie, ct_flow);
+		}
+		break;
+		case TC_CT_REMOVE: {
+			if (!found) {
+				trace("[flow: %p, cookie: %p] REMOVE not found", flow, flow->cookie);
+				return 0;
+			}
+
+			if (ct_flow->flags & MLX5E_TC_FLOW_OFFLOADED) {
+				mlx5_eswitch_del_offloaded_rule(esw, ct_flow->rule, &ct_flow->esw_attr, false);
+
+				ct_flow->flags &= ~MLX5E_TC_FLOW_OFFLOADED;
+				--num_of_hw_ct;
+				trace("[flow: %p, cookie: %p] REMOVE deleted ct flow: %p", flow, flow->cookie, ct_flow);
+			} else {
+				trace("[flow: %p, cookie: %p] REMOVE ct_flow %px isn't offloaded", flow, flow->cookie, ct_flow);
+			}
+
+			hash_del(&ct_flow->hlist);
+			kfree(ct_flow);
+		}
+		break;
+		case TC_CT_CLEAR: {
+		};
+		break;
+	}
+
+	return 0;
+}
+
 int mlx5e_configure_flower(struct mlx5e_priv *priv,
 			   struct tc_cls_flower_offload *f, int flags)
 {
@@ -2730,7 +2970,7 @@ int mlx5e_configure_flower(struct mlx5e_priv *priv,
 	int attr_size, err = 0;
 	u32 max_chain = mlx5_eswitch_get_chain_range(esw);
 	u32 max_prio = mlx5_eswitch_get_prio_range(esw);
-	u32 chain = f->common.chain_index;
+	u32 chain = f->common.chain_index & 0xFF;
 	u32 prio = TC_H_MAJ(f->common.prio) >> 16;
 	u8 flow_flags = 0;
 
@@ -2779,6 +3019,12 @@ int mlx5e_configure_flower(struct mlx5e_priv *priv,
 	err = parse_cls_flower(priv, flow, &parse_attr->spec, f);
 	if (err < 0)
 		goto err_free;
+
+	if (CT_STATE_MATCH(TCA_FLOWER_KEY_CT_FLAGS_TRACKED |
+			   TCA_FLOWER_KEY_CT_FLAGS_ESTABLISHED)) {
+		trace("We are trying to offload +trk+est rule");
+		flow->esw_attr->trk_est = true;
+	}
 
 	if (flow->flags & MLX5E_TC_FLOW_ESWITCH) {
 		flow->esw_attr->chain = chain;

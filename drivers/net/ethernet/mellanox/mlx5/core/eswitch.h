@@ -154,6 +154,7 @@ struct mlx5_esw_offload {
 	struct mlx5_eswitch_rep *vport_reps;
 	DECLARE_HASHTABLE(encap_tbl, 8);
 	DECLARE_HASHTABLE(mod_hdr_tbl, 8);
+	DECLARE_HASHTABLE(ct_tbl, 8);
 	u8 inline_mode;
 	u64 num_flows;
 	u8 encap;
@@ -285,6 +286,7 @@ struct mlx5_esw_flow_attr {
 	u32	chain;
 	u32	prio;
 	u32	dest_chain;
+	bool	trk_est;
 	struct mlx5e_tc_flow_parse_attr *parse_attr;
 };
 

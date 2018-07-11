@@ -52,6 +52,7 @@ static g_rand gact_rand[MAX_RAND] = { NULL, gact_net_rand, gact_determ };
 static const struct nla_policy gact_policy[TCA_GACT_MAX + 1] = {
 	[TCA_GACT_PARMS]	= { .len = sizeof(struct tc_gact) },
 	[TCA_GACT_PROB]		= { .len = sizeof(struct tc_gact_p) },
+	[TCA_GACT_RECIRC_ID]	= { .type = NLA_U32 },
 };
 
 static int tcf_gact_init(struct net *net, struct nlattr *nla,
@@ -89,7 +90,6 @@ static int tcf_gact_init(struct net *net, struct nlattr *nla,
 			return -EINVAL;
 	}
 #endif
-
 	if (!tcf_idr_check(tn, parm->index, a, bind)) {
 		ret = tcf_idr_create(tn, parm->index, est, a,
 				     &act_gact_ops, bind, true);
@@ -105,6 +105,10 @@ static int tcf_gact_init(struct net *net, struct nlattr *nla,
 	}
 
 	gact = to_gact(*a);
+
+	if (tb[TCA_GACT_RECIRC_ID]) {
+		gact->recirc_id = nla_get_u32(tb[TCA_GACT_RECIRC_ID]);
+	}
 
 	ASSERT_RTNL();
 	gact->tcf_action = parm->action;
@@ -138,6 +142,10 @@ static int tcf_gact(struct sk_buff *skb, const struct tc_action *a,
 		action = gact_rand[ptype](gact);
 	}
 #endif
+
+	if (gact->recirc_id)
+		skb->tc_recirc_id = gact->recirc_id;
+
 	bstats_cpu_update(this_cpu_ptr(gact->common.cpu_bstats), skb);
 	if (action == TC_ACT_SHOT)
 		qstats_drop_inc(this_cpu_ptr(gact->common.cpu_qstats));
@@ -189,6 +197,9 @@ static int tcf_gact_dump(struct sk_buff *skb, struct tc_action *a,
 			goto nla_put_failure;
 	}
 #endif
+	if (gact->recirc_id && nla_put_u32(skb, TCA_GACT_RECIRC_ID, gact->recirc_id))
+		goto nla_put_failure;
+
 	tcf_tm_dump(&t, &gact->tcf_tm);
 	if (nla_put_64bit(skb, TCA_GACT_TM, sizeof(t), &t, TCA_GACT_PAD))
 		goto nla_put_failure;

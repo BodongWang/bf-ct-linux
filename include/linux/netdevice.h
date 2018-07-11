@@ -793,6 +793,37 @@ enum tc_setup_type {
 	TC_SETUP_QDISC_RED,
 	TC_SETUP_QDISC_PRIO,
 	TC_SETUP_QDISC_MQ,
+	TC_SETUP_CT_TUPLE,
+};
+
+enum tc_5tuple_cmd {
+	TC_CT_ADD,
+	TC_CT_REMOVE,
+	TC_CT_CLEAR
+};
+
+struct tc_tuple {
+	__be16 etype;
+	u8     ip_proto;
+	union {
+		__be32 src_ipv4;
+		struct in6_addr src_ipv6;
+	};
+	union {
+		__be32 dst_ipv4;
+		struct in6_addr dst_ipv6;
+	};
+	__be16 src_port;
+	__be16 dst_port;
+};
+
+struct tc_tuple_offload {
+	struct tc_tuple tuple;
+
+	/* control */
+	enum tc_5tuple_cmd command;
+	unsigned long cookie;
+	uint32_t chain_index;
 };
 
 /* These structures hold the attributes of bpf state that are being passed

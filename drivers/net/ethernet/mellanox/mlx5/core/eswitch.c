@@ -1733,6 +1733,7 @@ int mlx5_eswitch_init(struct mlx5_core_dev *dev)
 
 	hash_init(esw->offloads.encap_tbl);
 	hash_init(esw->offloads.mod_hdr_tbl);
+	hash_init(esw->offloads.ct_tbl);
 	mutex_init(&esw->state_lock);
 
 	for (vport_num = 0; vport_num < total_vports; vport_num++) {
@@ -1749,12 +1750,14 @@ int mlx5_eswitch_init(struct mlx5_core_dev *dev)
 	esw->enabled_vports = 0;
 	esw->mode = SRIOV_NONE;
 	esw->offloads.inline_mode = MLX5_INLINE_MODE_NONE;
+	esw->offloads.encap = DEVLINK_ESWITCH_ENCAP_MODE_NONE;
+/*
 	if (MLX5_CAP_ESW_FLOWTABLE_FDB(dev, encap) &&
 	    MLX5_CAP_ESW_FLOWTABLE_FDB(dev, decap))
 		esw->offloads.encap = DEVLINK_ESWITCH_ENCAP_MODE_BASIC;
 	else
 		esw->offloads.encap = DEVLINK_ESWITCH_ENCAP_MODE_NONE;
-
+*/
 	dev->priv.eswitch = esw;
 	return 0;
 abort:

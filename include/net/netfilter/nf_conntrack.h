@@ -93,6 +93,8 @@ struct nf_conn {
 	u_int32_t secmark;
 #endif
 
+	char flower[32];
+
 	/* Extensions */
 	struct nf_ct_ext *ext;
 

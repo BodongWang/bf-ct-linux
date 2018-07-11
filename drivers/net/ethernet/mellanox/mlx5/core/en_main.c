@@ -3341,6 +3341,8 @@ static int mlx5e_setup_tc_cls_flower(struct mlx5e_priv *priv,
 	}
 }
 
+int mlx5e_rep_conf_ct_5tuple(struct mlx5e_priv *priv, struct tc_tuple_offload *tuple_cmd);
+
 static int mlx5e_setup_tc_block_cb(enum tc_setup_type type, void *type_data,
 				   void *cb_priv)
 {
@@ -3349,6 +3351,8 @@ static int mlx5e_setup_tc_block_cb(enum tc_setup_type type, void *type_data,
 	switch (type) {
 	case TC_SETUP_CLSFLOWER:
 		return mlx5e_setup_tc_cls_flower(priv, type_data, MLX5E_TC_INGRESS);
+	case TC_SETUP_CT_TUPLE:
+		return mlx5e_rep_conf_ct_5tuple(priv, type_data);
 	default:
 		return -EOPNOTSUPP;
 	}
