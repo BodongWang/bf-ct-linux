@@ -28,8 +28,24 @@
 #include <net/dst.h>
 #include <net/dst_metadata.h>
 
+#include <net/netfilter/nf_conntrack_core.h>
+
+#include <linux/yktrace.h>
+TRACE_ALL;
+
+static int num_of_sw_ct = 0;
+
+module_param(num_of_sw_ct, int, 0644);
+MODULE_PARM_DESC(num_of_sw_ct, "Number of tracked connections in software");
+
+int tuple_offload = 1;
+
+module_param(tuple_offload, int, 0644);
+MODULE_PARM_DESC(tuple_offload, "Control whether tuples are offloaded");
+
 struct fl_flow_key {
 	int	indev_ifindex;
+	u8	ct_state;
 	struct flow_dissector_key_control control;
 	struct flow_dissector_key_control enc_control;
 	struct flow_dissector_key_basic basic;
@@ -87,8 +103,11 @@ struct cls_fl_filter {
 	struct list_head list;
 	u32 handle;
 	u32 flags;
+	u32 recirc_id;
+	unsigned int in_hw_count;
 	struct rcu_work rwork;
 	struct net_device *hw_dev;
+	struct tcf_proto *tp;
 };
 
 static const struct rhashtable_params mask_ht_params = {
@@ -157,6 +176,139 @@ static struct cls_fl_filter *fl_lookup(struct fl_flow_mask *mask,
 				      mask->filter_ht_params);
 }
 
+static u8 fl_ct_get_state(enum ip_conntrack_info ctinfo)
+{
+	u8 ct_state = TCA_FLOWER_KEY_CT_FLAGS_TRACKED;
+
+	switch (ctinfo) {
+	case IP_CT_ESTABLISHED:
+	case IP_CT_ESTABLISHED_REPLY:
+		ct_state |= TCA_FLOWER_KEY_CT_FLAGS_ESTABLISHED;
+		break;
+	case IP_CT_NEW:
+		ct_state |= TCA_FLOWER_KEY_CT_FLAGS_NEW;
+		break;
+	default:
+		trace("fl_ct_get_state: ctinfo %d not supported", ctinfo);
+		break;
+	}
+
+	return ct_state;
+}
+
+static bool handle_ct_classify(struct sk_buff *skb, const struct tcf_proto *tp,
+			      struct fl_flow_mask *mask, struct cls_fl_filter *f,
+			      struct nf_conn *ct, u8 ct_state)
+{
+	struct net_device *dev = skb->dev;
+	struct net *net = dev_net(dev);
+	struct nf_conntrack_tuple nf_tuple;
+	struct tcphdr *tcph;
+	struct tc_tuple_offload tuple_cmd = {};
+	struct tc_tuple *tuple = &tuple_cmd.tuple;
+	struct tcf_block *block = tp->chain->block;
+
+	if (skb->protocol != htons(ETH_P_IP)) {
+		trace("ct: unknown protocol, skip");
+		return false;
+	}
+
+
+	if (!nf_ct_get_tuplepr(skb, skb_network_offset(skb),
+				NFPROTO_IPV4, net, &nf_tuple))
+	{
+		etrace("ct: error nf_ct_get_tuplepr");
+		return false;
+	}
+
+	tuple->etype    = skb->protocol;
+	tuple->ip_proto = nf_tuple.dst.protonum;
+	tuple->src_ipv4 = nf_tuple.src.u3.ip;
+	tuple->dst_ipv4 = nf_tuple.dst.u3.ip;
+	tuple->src_port = nf_tuple.src.u.tcp.port;
+	tuple->dst_port = nf_tuple.dst.u.tcp.port;
+	trace("ct: 5tuple: (ethtype: %X) %d, IPs %d.%d.%d.%d, %d.%d.%d.%d ports %d, %d (chain_idx: %d)",
+			ntohs(tuple->etype),
+			tuple->ip_proto,
+			NIPQUAD(tuple->src_ipv4),
+			NIPQUAD(tuple->dst_ipv4),
+			ntohs(tuple->src_port),
+			ntohs(tuple->dst_port),
+			tp->chain->index);
+
+	if (tuple->ip_proto == 6) {
+		tcph = tcp_hdr(skb);
+		if (!tcph)
+			return false;
+
+		trace("TCP: syn: %d, ack: %d, psh: %d, fin: %d, rst: %d",
+			tcph->syn, tcph->ack, tcph->psh, tcph->fin, tcph->rst);
+	} else {
+		etrace("Currently, we only support TCP");
+		return false;
+	}
+
+	if (!(ct_state & mask->key.ct_state
+				& TCA_FLOWER_KEY_CT_FLAGS_ESTABLISHED)) {
+		trace("connection is not ESTABLISHED yet");
+		return false;
+	}
+
+	if (tcph->fin || tcph->rst)
+		tuple_cmd.command = TC_CT_REMOVE;
+	else
+		tuple_cmd.command = TC_CT_ADD;
+
+	if (tuple_cmd.command == TC_CT_ADD &&
+	    ct->proto.tcp.state != TCP_CONNTRACK_ESTABLISHED &&
+	    ct->proto.tcp.state != TCP_CONNTRACK_SYN_RECV) {
+		trace("connection is not ESTABLISHED yet (ct->proto.tcp.state: %d)", ct->proto.tcp.state);
+		return false;
+	}
+
+	trace("ct_state is ESTABLISHED (ndo_cmd: %d)", tuple_cmd.command);
+
+	tuple_cmd.chain_index = tp->chain->index;
+	tuple_cmd.cookie = (unsigned long) f;
+
+	enum ip_conntrack_info ctinfo;
+	unsigned long *ptrs = (unsigned long *) ct->flower;
+	nf_ct_get(skb, &ctinfo);
+	int dir = (ctinfo == IP_CT_ESTABLISHED_REPLY ? 1 : 0);
+
+	if (tuple_cmd.command == TC_CT_ADD) {
+		if (ptrs[dir] == tuple_cmd.cookie)
+			return false;
+		if (ptrs[dir]) {
+			etrace("ptrs[dir] holds garbage");
+		}
+
+		/* increase only once */
+		if (!ptrs[2]) {
+			num_of_sw_ct++;
+			ptrs[2] = 1;
+		}
+	} else {
+		if (ptrs[2])
+			num_of_sw_ct--;
+		ptrs[2] = 0;
+	}
+
+	if (!tuple_offload)
+		return true;
+
+	if (!(f->flags & TCA_CLS_FLAGS_IN_HW))
+		return true;
+
+	if (tuple_cmd.command == TC_CT_ADD) {
+		ptrs[dir] = tuple_cmd.cookie;
+	}
+
+	tc_setup_cb_call(block, NULL, TC_SETUP_CT_TUPLE, &tuple_cmd, false);
+
+	return true;
+}
+
 static int fl_classify(struct sk_buff *skb, const struct tcf_proto *tp,
 		       struct tcf_result *res)
 {
@@ -165,6 +317,8 @@ static int fl_classify(struct sk_buff *skb, const struct tcf_proto *tp,
 	struct fl_flow_mask *mask;
 	struct fl_flow_key skb_key;
 	struct fl_flow_key skb_mkey;
+	enum ip_conntrack_info ctinfo;
+	struct nf_conn *ct = NULL;
 
 	list_for_each_entry_rcu(mask, &head->masks, list) {
 		fl_clear_masked_range(&skb_key, mask);
@@ -173,13 +327,25 @@ static int fl_classify(struct sk_buff *skb, const struct tcf_proto *tp,
 		/* skb_flow_dissect() does not set n_proto in case an unknown
 		 * protocol, so do it rather here.
 		 */
+
+		if (mask->key.ct_state) {
+			ct = nf_ct_get(skb, &ctinfo);
+			if (ct) {
+				skb_key.ct_state = fl_ct_get_state(ctinfo);
+			}
+			trace("skb %p chain %d ct_state 0x%x/0x%x, ct: %p",
+				skb, tp->chain->index, skb_key.ct_state, mask->key.ct_state, ct);
+		}
+
 		skb_key.basic.n_proto = skb->protocol;
 		skb_flow_dissect_tunnel_info(skb, &mask->dissector, &skb_key);
 		skb_flow_dissect(skb, &mask->dissector, &skb_key, 0);
-
 		fl_set_masked_key(&skb_mkey, &skb_key, mask);
 
 		f = fl_lookup(mask, &skb_mkey);
+		if (f && ct)
+			handle_ct_classify(skb, tp, mask, f, ct, skb_key.ct_state);
+
 		if (f && !tc_skip_sw(f->flags)) {
 			*res = f->res;
 			return tcf_exts_exec(skb, &f->exts, res);
@@ -283,12 +449,16 @@ static int fl_hw_replace_filter(struct tcf_proto *tp,
 	cls_flower.exts = &f->exts;
 	cls_flower.classid = f->res.classid;
 
+	cls_flower.ct_state_key = cls_flower.key->ct_state;
+	cls_flower.ct_state_mask = cls_flower.mask->ct_state;
+
 	err = tc_setup_cb_call(block, &f->exts, TC_SETUP_CLSFLOWER,
 			       &cls_flower, skip_sw);
 	if (err < 0) {
 		fl_hw_destroy_filter(tp, f, NULL);
 		return err;
 	} else if (err > 0) {
+		f->in_hw_count = err;
 		tcf_block_offload_inc(block, &f->flags);
 	}
 
@@ -447,6 +617,9 @@ static const struct nla_policy fl_policy[TCA_FLOWER_MAX + 1] = {
 	[TCA_FLOWER_KEY_IP_TOS_MASK]	= { .type = NLA_U8 },
 	[TCA_FLOWER_KEY_IP_TTL]		= { .type = NLA_U8 },
 	[TCA_FLOWER_KEY_IP_TTL_MASK]	= { .type = NLA_U8 },
+	[TCA_FLOWER_KEY_CT_STATE]	= { .type = NLA_U8 },
+	[TCA_FLOWER_KEY_CT_STATE_MASK]	= { .type = NLA_U8 },
+	[TCA_FLOWER_KEY_RECIRC_ID]	= { .type = NLA_U32 },
 };
 
 static void fl_set_key_val(struct nlattr **tb,
@@ -579,6 +752,11 @@ static int fl_set_key(struct net *net, struct nlattr **tb,
 		mask->indev_ifindex = 0xffffffff;
 	}
 #endif
+
+	if (tb[TCA_FLOWER_KEY_CT_STATE]) {
+		key->ct_state = nla_get_u8(tb[TCA_FLOWER_KEY_CT_STATE]);
+		mask->ct_state = nla_get_u8(tb[TCA_FLOWER_KEY_CT_STATE_MASK]);
+	}
 
 	fl_set_key_val(tb, key->eth.dst, TCA_FLOWER_KEY_ETH_DST,
 		       mask->eth.dst, TCA_FLOWER_KEY_ETH_DST_MASK,
@@ -958,6 +1136,7 @@ static int fl_change(struct net *net, struct sk_buff *in_skb,
 		err = -ENOBUFS;
 		goto errout_tb;
 	}
+	fnew->tp = tp;
 
 	err = tcf_exts_init(&fnew->exts, TCA_FLOWER_ACT, 0);
 	if (err < 0)
@@ -985,6 +1164,9 @@ static int fl_change(struct net *net, struct sk_buff *in_skb,
 		}
 	}
 
+	if (tb[TCA_FLOWER_KEY_RECIRC_ID])
+		fnew->recirc_id = nla_get_u32(tb[TCA_FLOWER_KEY_RECIRC_ID]);
+
 	err = fl_set_parms(net, tp, fnew, &mask, base, tb, tca[TCA_RATE], ovr,
 			   extack);
 	if (err)
@@ -1004,6 +1186,14 @@ static int fl_change(struct net *net, struct sk_buff *in_skb,
 					     fnew->mask->filter_ht_params);
 		if (err)
 			goto errout_mask;
+	}
+
+	{
+		struct fl_flow_key *key = &mask.key;
+		struct fl_flow_key *mask = &fnew->mkey;
+
+		trace("fl_change: hardware view ct: key: key->ct_state: %X, mask->ct_state: %X",
+			key->ct_state, mask->ct_state);
 	}
 
 	if (!tc_skip_hw(fnew->flags)) {
@@ -1071,20 +1261,59 @@ static void fl_walk(struct tcf_proto *tp, struct tcf_walker *arg)
 {
 	struct cls_fl_head *head = rtnl_dereference(tp->root);
 	struct cls_fl_filter *f;
-	struct fl_flow_mask *mask;
 
-	list_for_each_entry_rcu(mask, &head->masks, list) {
-		list_for_each_entry_rcu(f, &mask->filters, list) {
-			if (arg->count < arg->skip)
-				goto skip;
-			if (arg->fn(tp, f, arg) < 0) {
-				arg->stop = 1;
-				break;
+	arg->count = arg->skip;
+
+	while ((f = idr_get_next_ul(&head->handle_idr,
+				    &arg->cookie)) != NULL) {
+		if (arg->fn(tp, f, arg) < 0) {
+			arg->stop = 1;
+			break;
+		}
+		arg->cookie = f->handle + 1;
+		arg->count++;
+	}
+}
+
+static int fl_reoffload(struct tcf_proto *tp, bool add, tc_setup_cb_t *cb,
+			void *cb_priv, struct netlink_ext_ack *extack)
+{
+	struct cls_fl_head *head = rtnl_dereference(tp->root);
+	struct tc_cls_flower_offload cls_flower = {};
+	struct tcf_block *block = tp->chain->block;
+	struct fl_flow_mask *mask;
+	struct cls_fl_filter *f;
+	int err;
+
+	list_for_each_entry(mask, &head->masks, list) {
+		list_for_each_entry(f, &mask->filters, list) {
+			if (tc_skip_hw(f->flags))
+				continue;
+
+			tc_cls_common_offload_init(&cls_flower.common, tp,
+						   f->flags, extack);
+			cls_flower.command = add ?
+				TC_CLSFLOWER_REPLACE : TC_CLSFLOWER_DESTROY;
+			cls_flower.cookie = (unsigned long)f;
+			cls_flower.dissector = &mask->dissector;
+			cls_flower.mask = &f->mkey;
+			cls_flower.key = &f->key;
+			cls_flower.exts = &f->exts;
+			cls_flower.classid = f->res.classid;
+
+			err = cb(TC_SETUP_CLSFLOWER, &cls_flower, cb_priv);
+			if (err) {
+				if (add && tc_skip_sw(f->flags))
+					return err;
+				continue;
 			}
-skip:
-			arg->count++;
+
+			tc_cls_offload_cnt_update(block, &f->in_hw_count,
+						  &f->flags, add);
 		}
 	}
+
+	return 0;
 }
 
 static int fl_dump_key_val(struct sk_buff *skb,
@@ -1247,6 +1476,12 @@ static int fl_dump(struct net *net, struct tcf_proto *tp, void *fh,
 			goto nla_put_failure;
 	}
 
+	if (mask->ct_state) {
+		fl_dump_key_val(skb, &key->ct_state, TCA_FLOWER_KEY_CT_STATE,
+			    &mask->ct_state, TCA_FLOWER_KEY_CT_STATE_MASK,
+			    sizeof(key->ct_state));
+	}
+
 	if (!tc_skip_hw(f->flags))
 		fl_hw_update_stats(tp, f);
 
@@ -1406,6 +1641,9 @@ static int fl_dump(struct net *net, struct tcf_proto *tp, void *fh,
 	if (f->flags && nla_put_u32(skb, TCA_FLOWER_FLAGS, f->flags))
 		goto nla_put_failure;
 
+	if (f->recirc_id && nla_put_u32(skb, TCA_FLOWER_KEY_RECIRC_ID, f->recirc_id))
+		goto nla_put_failure;
+
 	if (tcf_exts_dump(skb, &f->exts))
 		goto nla_put_failure;
 
@@ -1438,6 +1676,7 @@ static struct tcf_proto_ops cls_fl_ops __read_mostly = {
 	.change		= fl_change,
 	.delete		= fl_delete,
 	.walk		= fl_walk,
+	.reoffload	= fl_reoffload,
 	.dump		= fl_dump,
 	.bind_class	= fl_bind_class,
 	.owner		= THIS_MODULE,

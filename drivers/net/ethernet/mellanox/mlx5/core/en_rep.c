@@ -759,9 +759,6 @@ static int mlx5e_rep_setup_tc_cb_egdev(enum tc_setup_type type, void *type_data,
 {
 	struct mlx5e_priv *priv = cb_priv;
 
-	if (!tc_cls_can_offload_and_chain0(priv->netdev, type_data))
-		return -EOPNOTSUPP;
-
 	switch (type) {
 	case TC_SETUP_CLSFLOWER:
 		return mlx5e_rep_setup_tc_cls_flower(priv, type_data, MLX5E_TC_EGRESS);
@@ -770,17 +767,47 @@ static int mlx5e_rep_setup_tc_cb_egdev(enum tc_setup_type type, void *type_data,
 	}
 }
 
+struct conf_5tuple_work {
+	struct work_struct work;
+	struct mlx5e_priv *priv;
+	struct tc_tuple_offload tuple_cmd;
+};
+
+static void mlx5e_configure_5tuple_work(struct work_struct *work)
+{
+	struct conf_5tuple_work *twork = container_of(work, struct conf_5tuple_work, work);
+	struct tc_tuple_offload *tuple_cmd = &twork->tuple_cmd;
+
+	rtnl_lock();
+	mlx5e_configure_ct_5_tuple(twork->priv, tuple_cmd);
+	rtnl_unlock();
+
+	kfree(twork);
+}
+
+int mlx5e_rep_conf_ct_5tuple(struct mlx5e_priv *priv, struct tc_tuple_offload *tuple_cmd)
+{
+	struct conf_5tuple_work *twork = kzalloc(sizeof(struct conf_5tuple_work), GFP_KERNEL);
+
+	twork->tuple_cmd = *tuple_cmd;
+	twork->priv = priv;
+
+	INIT_WORK(&twork->work, mlx5e_configure_5tuple_work);
+	queue_work(priv->wq, &twork->work);
+
+	return 0;
+}
+
 static int mlx5e_rep_setup_tc_cb(enum tc_setup_type type, void *type_data,
 				 void *cb_priv)
 {
 	struct mlx5e_priv *priv = cb_priv;
 
-	if (!tc_cls_can_offload_and_chain0(priv->netdev, type_data))
-		return -EOPNOTSUPP;
-
 	switch (type) {
 	case TC_SETUP_CLSFLOWER:
 		return mlx5e_rep_setup_tc_cls_flower(priv, type_data, MLX5E_TC_INGRESS);
+	case TC_SETUP_CT_TUPLE:
+		return mlx5e_rep_conf_ct_5tuple(priv, type_data);
 	default:
 		return -EOPNOTSUPP;
 	}
@@ -797,7 +824,7 @@ static int mlx5e_rep_setup_tc_block(struct net_device *dev,
 	switch (f->command) {
 	case TC_BLOCK_BIND:
 		return tcf_block_cb_register(f->block, mlx5e_rep_setup_tc_cb,
-					     priv, priv);
+					     priv, priv, f->extack);
 	case TC_BLOCK_UNBIND:
 		tcf_block_cb_unregister(f->block, mlx5e_rep_setup_tc_cb, priv);
 		return 0;
@@ -896,6 +923,9 @@ static void
 mlx5e_rep_get_stats(struct net_device *dev, struct rtnl_link_stats64 *stats)
 {
 	struct mlx5e_priv *priv = netdev_priv(dev);
+
+	/* update HW stats in background for next time */
+	queue_delayed_work(priv->wq, &priv->update_stats_work, 0);
 
 	memcpy(stats, &priv->stats.vf_vport, sizeof(*stats));
 }

@@ -678,7 +678,8 @@ struct sk_buff {
 				int			ip_defrag_offset;
 			};
 		};
-		struct rb_node	rbnode; /* used in netem & tcp stack */
+		struct rb_node		rbnode; /* used in netem & tcp stack */
+		struct list_head	list;
 	};
 	struct sock		*sk;
 
@@ -790,6 +791,7 @@ struct sk_buff {
 	__u8			tc_at_ingress:1;
 	__u8			tc_redirected:1;
 	__u8			tc_from_ingress:1;
+	__u32			tc_recirc_id;
 #endif
 
 #ifdef CONFIG_NET_SCHED

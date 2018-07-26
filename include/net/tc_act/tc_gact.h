@@ -13,6 +13,7 @@ struct tcf_gact {
 	int			tcfg_paction;
 	atomic_t		packets;
 #endif
+	u32			recirc_id;
 };
 #define to_gact(a) ((struct tcf_gact *)a)
 

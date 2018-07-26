@@ -40,6 +40,7 @@
 #include "diag/fs_tracepoint.h"
 #include "accel/ipsec.h"
 #include "fpga/ipsec.h"
+#include "eswitch.h"
 
 #define INIT_TREE_NODE_ARRAY_SIZE(...)	(sizeof((struct init_tree_node[]){__VA_ARGS__}) /\
 					 sizeof(struct init_tree_node))
@@ -764,7 +765,10 @@ static struct mlx5_flow_table *find_closest_ft_recursive(struct fs_node  *root,
 	     pos = list_advance_entry(pos, reverse))
 
 	struct fs_node *iter = list_entry(start, struct fs_node, list);
+	struct fs_node *start_iter = iter;
 	struct mlx5_flow_table *ft = NULL;
+	struct mlx5_flow_namespace *ns = NULL;
+	struct fs_prio *prio = NULL;
 
 	if (!root)
 		return NULL;
@@ -774,6 +778,15 @@ static struct mlx5_flow_table *find_closest_ft_recursive(struct fs_node  *root,
 			fs_get_obj(ft, iter);
 			return ft;
 		}
+
+		if (root->type == FS_TYPE_PRIO &&
+		    start_iter->type == FS_TYPE_NAMESPACE &&
+		    iter->type == FS_TYPE_NAMESPACE) {
+			fs_get_obj(ns, iter);
+			fs_get_obj(prio, root);
+			continue;
+		}
+
 		ft = find_closest_ft_recursive(iter, &iter->children, reverse);
 		if (ft)
 			return ft;
@@ -1824,7 +1837,7 @@ search_again_locked:
 
 	g = alloc_auto_flow_group(ft, spec);
 	if (IS_ERR(g)) {
-		rule = (void *)g;
+		rule = ERR_CAST(g);
 		up_write_ref_node(&ft->node);
 		return rule;
 	}
@@ -2105,6 +2118,18 @@ struct mlx5_flow_namespace *mlx5_get_flow_namespace(struct mlx5_core_dev *dev,
 	return ns;
 }
 EXPORT_SYMBOL(mlx5_get_flow_namespace);
+
+struct mlx5_flow_namespace *mlx5_get_fdb_sub_ns(struct mlx5_core_dev *dev,
+						int n)
+{
+	struct mlx5_flow_steering *steering = dev->priv.steering;
+
+	if (!steering || !steering->fdb_root_ns || !steering->fdb_sub_ns)
+		return NULL;
+
+	return steering->fdb_sub_ns[n];
+}
+EXPORT_SYMBOL(mlx5_get_fdb_sub_ns);
 
 struct mlx5_flow_namespace *mlx5_get_flow_vport_acl_namespace(struct mlx5_core_dev *dev,
 							      enum mlx5_flow_namespace_type type,
@@ -2456,6 +2481,9 @@ void mlx5_cleanup_fs(struct mlx5_core_dev *dev)
 	cleanup_egress_acls_root_ns(dev);
 	cleanup_ingress_acls_root_ns(dev);
 	cleanup_root_ns(steering->fdb_root_ns);
+	steering->fdb_root_ns = NULL;
+	kfree(steering->fdb_sub_ns);
+	steering->fdb_sub_ns = NULL;
 	cleanup_root_ns(steering->sniffer_rx_root_ns);
 	cleanup_root_ns(steering->sniffer_tx_root_ns);
 	cleanup_root_ns(steering->egress_root_ns);
@@ -2501,27 +2529,59 @@ static int init_sniffer_rx_root_ns(struct mlx5_flow_steering *steering)
 
 static int init_fdb_root_ns(struct mlx5_flow_steering *steering)
 {
-	struct fs_prio *prio;
+	struct mlx5_flow_namespace *ns;
+	struct fs_prio *maj_prio, *min_prio;
+	int prio, chain, err, levels;
 
 	steering->fdb_root_ns = create_root_ns(steering, FS_FT_FDB);
 	if (!steering->fdb_root_ns)
 		return -ENOMEM;
 
-	prio = fs_create_prio(&steering->fdb_root_ns->ns, 0, 2);
-	if (IS_ERR(prio))
-		goto out_err;
+	steering->fdb_sub_ns = kzalloc(sizeof(steering->fdb_sub_ns) *
+				       FDB_MAX_CHAIN + 1, GFP_KERNEL);
+	if (!steering->fdb_sub_ns)
+		return -ENOMEM;
 
-	prio = fs_create_prio(&steering->fdb_root_ns->ns, 1, 1);
-	if (IS_ERR(prio))
+	levels = 2 * FDB_MAX_PRIO * (FDB_MAX_CHAIN + 1);
+	maj_prio = fs_create_prio(&steering->fdb_root_ns->ns, 0, levels);
+	if (IS_ERR(maj_prio)) {
+		err = PTR_ERR(maj_prio);
 		goto out_err;
+	}
+
+	for (chain = 0; chain <= FDB_MAX_CHAIN; chain++) {
+		ns = fs_create_namespace(maj_prio);
+		if (IS_ERR(ns)) {
+			err = PTR_ERR(ns);
+			goto out_err;
+		}
+
+		for (prio = 0; prio < FDB_MAX_PRIO * (chain + 1); prio++) {
+			min_prio = fs_create_prio(ns, prio, 2);
+			if (IS_ERR(min_prio)) {
+				err = PTR_ERR(min_prio);
+				goto out_err;
+			}
+		}
+
+		steering->fdb_sub_ns[chain] = ns;
+	}
+
+	maj_prio = fs_create_prio(&steering->fdb_root_ns->ns, 1, 1);
+	if (IS_ERR(maj_prio)) {
+		err = PTR_ERR(maj_prio);
+		goto out_err;
+	}
 
 	set_prio_attrs(steering->fdb_root_ns);
 	return 0;
 
 out_err:
 	cleanup_root_ns(steering->fdb_root_ns);
+	kfree(steering->fdb_sub_ns);
+	steering->fdb_sub_ns = NULL;
 	steering->fdb_root_ns = NULL;
-	return PTR_ERR(prio);
+	return err;
 }
 
 static int init_egress_acl_root_ns(struct mlx5_flow_steering *steering, int vport)
