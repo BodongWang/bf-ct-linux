@@ -132,6 +132,7 @@ enum {
 #define TCA_CLS_FLAGS_IN_HW	(1 << 2) /* filter is offloaded to HW */
 #define TCA_CLS_FLAGS_NOT_IN_HW (1 << 3) /* filter isn't offloaded to HW */
 #define TCA_CLS_FLAGS_VERBOSE	(1 << 4) /* verbose logging */
+#define TCA_CLS_FLAGS_DELETED	(1 << 5) /* filter was deleted concurrently */
 
 /* U32 filters */
 
