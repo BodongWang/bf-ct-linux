@@ -1363,10 +1363,14 @@ static void mini_qdisc_rcu_func(struct rcu_head *head)
 {
 }
 
-void mini_qdisc_pair_swap(struct mini_Qdisc_pair *miniqp,
-			  struct tcf_proto *tp_head)
+void __mini_qdisc_pair_swap(struct mini_Qdisc_pair *miniqp,
+			    struct tcf_proto *tp_head)
 {
-	struct mini_Qdisc *miniq_old = rtnl_dereference(*miniqp->p_miniq);
+	/* p_miniq is either changed on ordered workqueue or during miniqp
+	 * cleanup. In both cases no concurrent modification is possible.
+	 */
+	struct mini_Qdisc *miniq_old =
+		rcu_dereference_protected(*miniqp->p_miniq, 1);
 	struct mini_Qdisc *miniq;
 
 	if (!tp_head) {
@@ -1394,6 +1398,25 @@ void mini_qdisc_pair_swap(struct mini_Qdisc_pair *miniqp,
 		 */
 		call_rcu_bh(&miniq_old->rcu, mini_qdisc_rcu_func);
 }
+
+void mini_qdisc_pair_swap_work(struct work_struct *work)
+{
+	struct mini_Qdisc_pair *miniqp = container_of(work,
+						      struct mini_Qdisc_pair,
+						      work);
+	struct tcf_proto *tp_head;
+
+	tp_head = xchg(&miniqp->tp_head, ERR_PTR(-ENOENT));
+	if (!IS_ERR(tp_head))
+		__mini_qdisc_pair_swap(miniqp, tp_head);
+}
+
+void mini_qdisc_pair_swap(struct mini_Qdisc_pair *miniqp,
+			  struct tcf_proto *tp_head)
+{
+	xchg(&miniqp->tp_head, tp_head);
+	tc_queue_proto_work(&miniqp->work);
+}
 EXPORT_SYMBOL(mini_qdisc_pair_swap);
 
 void mini_qdisc_pair_init(struct mini_Qdisc_pair *miniqp, struct Qdisc *qdisc,
@@ -1404,5 +1427,13 @@ void mini_qdisc_pair_init(struct mini_Qdisc_pair *miniqp, struct Qdisc *qdisc,
 	miniqp->miniq2.cpu_bstats = qdisc->cpu_bstats;
 	miniqp->miniq2.cpu_qstats = qdisc->cpu_qstats;
 	miniqp->p_miniq = p_miniq;
+	INIT_WORK(&miniqp->work, mini_qdisc_pair_swap_work);
 }
 EXPORT_SYMBOL(mini_qdisc_pair_init);
+
+void mini_qdisc_pair_cleanup(struct mini_Qdisc_pair *miniqp)
+{
+	cancel_work_sync(&miniqp->work);
+	__mini_qdisc_pair_swap(miniqp, NULL);
+}
+EXPORT_SYMBOL(mini_qdisc_pair_cleanup);

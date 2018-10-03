@@ -107,12 +107,14 @@ out:
 EXPORT_SYMBOL(register_tcf_proto_ops);
 
 static struct workqueue_struct *tc_filter_wq;
+static struct workqueue_struct *tc_proto_wq;
 
 int unregister_tcf_proto_ops(struct tcf_proto_ops *ops)
 {
 	struct tcf_proto_ops *t;
 	int rc = -ENOENT;
 
+	flush_workqueue(tc_proto_wq);
 	/* Wait for outstanding call_rcu()s, if any, from a
 	 * tcf_proto_ops's destroy() handler.
 	 */
@@ -139,6 +141,12 @@ bool tcf_queue_work(struct rcu_work *rwork, work_func_t func)
 }
 EXPORT_SYMBOL(tcf_queue_work);
 
+bool tc_queue_proto_work(struct work_struct *work)
+{
+	return queue_work(tc_proto_wq, work);
+}
+EXPORT_SYMBOL(tc_queue_proto_work);
+
 /* Select new prio value from the range, managed by kernel. */
 
 static inline u32 tcf_auto_prio(struct tcf_proto *tp)
@@ -149,6 +157,23 @@ static inline u32 tcf_auto_prio(struct tcf_proto *tp)
 		first = tp->prio - 1;
 
 	return TC_H_MAJ(first);
+}
+
+static void tcf_chain_put(struct tcf_chain *chain);
+
+static void tcf_proto_destroy_work(struct work_struct *work)
+{
+	struct tcf_proto *tp = container_of(work, struct tcf_proto, work);
+	struct tcf_chain *chain = tp->chain;
+
+	rtnl_lock();
+
+	tp->ops->destroy(tp, NULL);
+	module_put(tp->ops->owner);
+	kfree_rcu(tp, rcu);
+	tcf_chain_put(chain);
+
+	rtnl_unlock();
 }
 
 static struct tcf_proto *tcf_proto_create(const char *kind, u32 protocol,
@@ -171,6 +196,7 @@ static struct tcf_proto *tcf_proto_create(const char *kind, u32 protocol,
 	tp->protocol = protocol;
 	tp->prio = prio;
 	tp->chain = chain;
+	INIT_WORK(&tp->work, tcf_proto_destroy_work);
 
 	err = tp->ops->init(tp);
 	if (err) {
@@ -187,9 +213,7 @@ errout:
 static void tcf_proto_destroy(struct tcf_proto *tp,
 			      struct netlink_ext_ack *extack)
 {
-	tp->ops->destroy(tp, extack);
-	module_put(tp->ops->owner);
-	kfree_rcu(tp, rcu);
+	tc_queue_proto_work(&tp->work);
 }
 
 struct tcf_filter_chain_list_item {
@@ -361,7 +385,6 @@ static void tcf_chain_flush(struct tcf_chain *chain)
 		RCU_INIT_POINTER(chain->filter_chain, tp->next);
 		tcf_proto_destroy(tp, NULL);
 		tp = rtnl_dereference(chain->filter_chain);
-		tcf_chain_put(chain);
 	}
 }
 
@@ -1131,7 +1154,6 @@ static void tcf_chain_tp_remove(struct tcf_chain *chain,
 	if (tp == chain->filter_chain)
 		tcf_chain0_head_change(chain, next);
 	RCU_INIT_POINTER(*chain_info->pprev, next);
-	tcf_chain_put(chain);
 }
 
 static struct tcf_proto *tcf_chain_tp_find(struct tcf_chain *chain,
@@ -1420,8 +1442,14 @@ replay:
 		tfilter_notify(net, skb, n, tp, block, q, parent, fh,
 			       RTM_NEWTFILTER, false);
 	} else {
-		if (tp_created)
+		if (tp_created) {
+			/* tp wasn't inserted to chain tp list. Take reference
+			 * to chain manually for tcf_proto_destroy() to
+			 * release.
+			 */
+			tcf_chain_hold(chain);
 			tcf_proto_destroy(tp, NULL);
+		}
 	}
 
 errout:
@@ -2351,6 +2379,12 @@ static int __init tc_filter_init(void)
 	if (!tc_filter_wq)
 		return -ENOMEM;
 
+	tc_proto_wq = alloc_ordered_workqueue("tc_proto_workqueue", 0);
+	if (!tc_proto_wq) {
+		err = -ENOMEM;
+		goto err_proto_wq;
+	}
+
 	err = register_pernet_subsys(&tcf_net_ops);
 	if (err)
 		goto err_register_pernet_subsys;
@@ -2367,6 +2401,8 @@ static int __init tc_filter_init(void)
 	return 0;
 
 err_register_pernet_subsys:
+	destroy_workqueue(tc_proto_wq);
+err_proto_wq:
 	destroy_workqueue(tc_filter_wq);
 	return err;
 }
