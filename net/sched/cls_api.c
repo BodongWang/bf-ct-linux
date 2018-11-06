@@ -197,6 +197,7 @@ static struct tcf_proto *tcf_proto_create(const char *kind, u32 protocol,
 	tp->prio = prio;
 	tp->chain = chain;
 	INIT_WORK(&tp->work, tcf_proto_destroy_work);
+	refcount_set(&tp->refcnt, 1);
 
 	err = tp->ops->init(tp);
 	if (err) {
@@ -210,10 +211,22 @@ errout:
 	return ERR_PTR(err);
 }
 
+static void tcf_proto_get(struct tcf_proto *tp)
+{
+	refcount_inc(&tp->refcnt);
+}
+
 static void tcf_proto_destroy(struct tcf_proto *tp,
 			      struct netlink_ext_ack *extack)
 {
 	tc_queue_proto_work(&tp->work);
+}
+
+static void tcf_proto_put(struct tcf_proto *tp,
+			  struct netlink_ext_ack *extack)
+{
+	if (refcount_dec_and_test(&tp->refcnt))
+		tcf_proto_destroy(tp, extack);
 }
 
 #define ASSERT_BLOCK_LOCKED(block)					\
@@ -458,13 +471,13 @@ static void tcf_chain_flush(struct tcf_chain *chain)
 
 	spin_lock(&chain->filter_chain_lock);
 	tp = tcf_chain_dereference(chain->filter_chain, chain);
+	RCU_INIT_POINTER(chain->filter_chain, NULL);
 	tcf_chain0_head_change(chain, NULL);
 	spin_unlock(&chain->filter_chain_lock);
 
 	while (tp) {
-		RCU_INIT_POINTER(chain->filter_chain, tp->next);
-		tcf_proto_destroy(tp, NULL);
-		tp = rtnl_dereference(chain->filter_chain);
+		tcf_proto_put(tp, NULL);
+		tp = tp->next;
 	}
 }
 
@@ -1275,9 +1288,9 @@ static void tcf_chain_tp_insert(struct tcf_chain *chain,
 {
 	if (*chain_info->pprev == chain->filter_chain)
 		tcf_chain0_head_change(chain, tp);
+	tcf_proto_get(tp);
 	RCU_INIT_POINTER(tp->next, tcf_chain_tp_prev(chain, chain_info));
 	rcu_assign_pointer(*chain_info->pprev, tp);
-	tcf_chain_hold(chain);
 }
 
 static void tcf_chain_tp_remove(struct tcf_chain *chain,
@@ -1315,7 +1328,12 @@ static struct tcf_proto *tcf_chain_tp_find(struct tcf_chain *chain,
 		}
 	}
 	chain_info->pprev = pprev;
-	chain_info->next = tp ? tp->next : NULL;
+	if (tp) {
+		chain_info->next = tp->next;
+		tcf_proto_get(tp);
+	} else {
+		chain_info->next = NULL;
+	}
 	return tp;
 }
 
@@ -1590,6 +1608,12 @@ replay:
 errout:
 	if (chain)
 		tcf_chain_put(chain);
+	if (chain) {
+		if (tp && !IS_ERR(tp))
+			tcf_proto_put(tp, NULL);
+		if (!tp_created)
+			tcf_chain_put(chain);
+	}
 	tcf_block_release(q, block);
 	if (err == -EAGAIN)
 		/* Replay the request. */
@@ -1720,8 +1744,11 @@ static int tc_del_tfilter(struct sk_buff *skb, struct nlmsghdr *n,
 	}
 
 errout:
-	if (chain)
+	if (chain) {
+		if (tp && !IS_ERR(tp))
+			tcf_proto_put(tp, NULL);
 		tcf_chain_put(chain);
+	}
 	tcf_block_release(q, block);
 	return err;
 
@@ -1812,8 +1839,11 @@ static int tc_get_tfilter(struct sk_buff *skb, struct nlmsghdr *n,
 	}
 
 errout:
-	if (chain)
+	if (chain) {
+		if (tp && !IS_ERR(tp))
+			tcf_proto_put(tp, NULL);
 		tcf_chain_put(chain);
+	}
 	tcf_block_release(q, block);
 	return err;
 }
