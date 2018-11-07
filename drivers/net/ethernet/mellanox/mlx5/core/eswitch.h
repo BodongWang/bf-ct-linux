@@ -35,6 +35,8 @@
 
 #include <linux/if_ether.h>
 #include <linux/if_link.h>
+#include <linux/rwsem.h>
+#include <linux/atomic.h>
 #include <net/devlink.h>
 #include <linux/mlx5/device.h>
 #include <linux/mlx5/eswitch.h>
@@ -169,8 +171,16 @@ struct mlx5_esw_offload {
 	DECLARE_HASHTABLE(encap_tbl, 8);
 	spinlock_t mod_hdr_tbl_lock; /* protects mod_hdr_tbl */
 	DECLARE_HASHTABLE(mod_hdr_tbl, 8);
+
+	/* Protects num_flows and modes variables. Mode cannot be changed when
+	 * num_flows is non-zero, so single lock must be used to protect these
+	 * variables. num_flows can be changed while holding mode_lock for
+	 * reading, but users that change inline_mode or encap must obtain the
+	 * lock in write mode.
+	 */
+	struct rw_semaphore mode_lock;
 	u8 inline_mode;
-	u64 num_flows;
+	atomic64_t num_flows;
 	u8 encap;
 };
 
@@ -326,6 +336,16 @@ int mlx5_eswitch_del_vlan_action(struct mlx5_eswitch *esw,
 				 struct mlx5_esw_flow_attr *attr);
 int __mlx5_eswitch_set_vport_vlan(struct mlx5_eswitch *esw,
 				  int vport, u16 vlan, u8 qos, u8 set_flags);
+
+static inline void mlx5_eswitch_read_lock_mode(struct mlx5_eswitch *esw)
+{
+	down_read(&esw->offloads.mode_lock);
+}
+
+static inline void mlx5_eswitch_read_unlock_mode(struct mlx5_eswitch *esw)
+{
+	up_read(&esw->offloads.mode_lock);
+}
 
 static inline bool mlx5_eswitch_vlan_actions_supported(struct mlx5_core_dev *dev,
 						       u8 vlan_depth)

@@ -3494,10 +3494,20 @@ mlx5e_add_fdb_flow(struct mlx5e_priv *priv,
 		   int flow_flags,
 		   struct mlx5e_tc_flow **__flow)
 {
+	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
 	struct netlink_ext_ack *extack = f->common.extack;
 	struct mlx5e_tc_flow_parse_attr *parse_attr;
 	struct mlx5e_tc_flow *flow;
 	int attr_size, err;
+
+	/* Offloads inline mode is checked in parse_cls_flower(), but offloads
+	 * num_flows counter is only incremented afterwards in
+	 * mlx5_eswitch_add_offloaded_rule(). Without rtnl lock protection mode
+	 * can be changed concurrently when adding first flow (num_flows counter
+	 * is 0). Take lock mode in read mode while configuring flower to
+	 * prevent concurrent offloads mode changes.
+	 */
+	mlx5_eswitch_read_lock_mode(esw);
 
 	flow_flags |= MLX5E_TC_FLOW_ESWITCH;
 	attr_size  = sizeof(struct mlx5_esw_flow_attr);
@@ -3516,6 +3526,8 @@ mlx5e_add_fdb_flow(struct mlx5e_priv *priv,
 	if (err)
 		goto err_free;
 
+	mlx5_eswitch_read_unlock_mode(esw);
+
 	if (!(flow->esw_attr->action &
 	      MLX5_FLOW_CONTEXT_ACTION_PACKET_REFORMAT))
 		kvfree(parse_attr);
@@ -3530,6 +3542,7 @@ err_free:
 		kvfree(parse_attr);
 	mlx5e_flow_put(priv, flow);
 out:
+	mlx5_eswitch_read_unlock_mode(esw);
 	return err;
 }
 
