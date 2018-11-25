@@ -1265,7 +1265,7 @@ static void microflow_unlink_dummy_counters(struct mlx5e_microflow *microflow)
 }
 
 static void mlx5e_tc_del_fdb_flow(struct mlx5e_priv *priv,
-				  struct mlx5e_tc_flow *flow)
+				  struct mlx5e_tc_flow *flow);
 
 static void microflow_free(struct mlx5e_microflow *microflow);
 
