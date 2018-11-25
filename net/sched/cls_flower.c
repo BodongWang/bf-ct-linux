@@ -239,7 +239,9 @@ static void fl_notify_underlying_device(struct sk_buff *skb, const struct tcf_pr
 	mf.chain_index = tp->chain->index;
 
 	/* TODO: should be replaced by something else TBD */
-	tc_setup_cb_call(block, NULL, TC_SETUP_MICROFLOW, &mf, false);
+	tc_setup_cb_call(block, NULL, TC_SETUP_MICROFLOW,
+			 &mf, false, false, NULL, NULL,
+			 TC_BLOCK_OFFLOADCNT_NOOP);
 }
 
 static int fl_classify(struct sk_buff *skb, const struct tcf_proto *tp,
