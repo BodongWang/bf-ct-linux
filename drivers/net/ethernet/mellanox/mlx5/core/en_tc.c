@@ -1222,8 +1222,6 @@ mlx5e_tc_add_fdb_flow(struct mlx5e_priv *priv,
 	/* TODO: merge change: this make sense now? */
 	// kfree(parse_attr->mod_hdr_actions);
 
-	return rule;
-
 	if (IS_ERR(flow->rule[0]))
 		return PTR_ERR(flow->rule[0]);
 
@@ -1240,12 +1238,14 @@ static struct rhashtable *get_mf_ht(struct mlx5e_priv *priv)
 	return &uplink_rpriv->mf_ht;
 }
 
+static struct mlx5_fc *mlx5e_tc_get_counter(struct mlx5e_tc_flow *flow);
+
 static void microflow_link_dummy_counters(struct mlx5e_microflow *microflow)
 {
 	struct mlx5e_tc_flow *flow = microflow->flow;
 	struct mlx5_fc *counter;
 
-	counter = mlx5_flow_rule_counter(flow->rule[0]);
+	counter = mlx5e_tc_get_counter(flow);
 	if (!counter)
 		return;
 
@@ -1257,7 +1257,7 @@ static void microflow_unlink_dummy_counters(struct mlx5e_microflow *microflow)
 	struct mlx5e_tc_flow *flow = microflow->flow;
 	struct mlx5_fc *counter;
 
-	counter = mlx5_flow_rule_counter(flow->rule[0]);
+	counter = mlx5e_tc_get_counter(flow);
 	if (!counter)
 		return;
 
@@ -1326,7 +1326,7 @@ static void mlx5e_tc_del_fdb_flow(struct mlx5e_priv *priv,
 	trace("mlx5e_tc_del_fdb_flow");
 
 	/* TODO: merge change: flags is atomic */
-	if (flow->flags & MLX5E_TC_FLOW_SIMPLE) {
+	if (atomic_read(&flow->flags) & MLX5E_TC_FLOW_SIMPLE) {
 		__mlx5e_tc_del_fdb_flow(priv, flow);
 	} else {
 		struct mlx5e_microflow_node *mnode, *n;
@@ -3439,7 +3439,6 @@ static int parse_tc_fdb_actions(struct mlx5e_priv *priv, struct tcf_exts *exts,
 				struct mlx5e_tc_flow *flow,
 				struct netlink_ext_ack *extack)
 {
-	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
 	struct mlx5_esw_flow_attr *attr = flow->esw_attr;
 	struct mlx5e_rep_priv *rpriv = priv->ppriv;
 	struct ip_tunnel_info *info = NULL;
@@ -3459,7 +3458,7 @@ static int parse_tc_fdb_actions(struct mlx5e_priv *priv, struct tcf_exts *exts,
 		if (is_tcf_gact_shot(a)) {
 			action |= MLX5_FLOW_CONTEXT_ACTION_DROP |
 				  MLX5_FLOW_CONTEXT_ACTION_COUNT;
-			if (flow->flags & MLX5E_TC_FLOW_EGRESS) {
+			if (atomic_read(&flow->flags) & MLX5E_TC_FLOW_EGRESS) {
 				trace("shot endpoint, adding decap action");
 				action |= MLX5_FLOW_CONTEXT_ACTION_DECAP;
 			}
@@ -3510,7 +3509,7 @@ static int parse_tc_fdb_actions(struct mlx5e_priv *priv, struct tcf_exts *exts,
 			    is_merged_eswitch_dev(priv, out_dev)) {
 				action |= MLX5_FLOW_CONTEXT_ACTION_FWD_DEST |
 					  MLX5_FLOW_CONTEXT_ACTION_COUNT;
-				if (flow->flags & MLX5E_TC_FLOW_EGRESS) {
+				if (atomic_read(&flow->flags) & MLX5E_TC_FLOW_EGRESS) {
 					trace("egress mirred endpoint, adding decap action");
 					action |= MLX5_FLOW_CONTEXT_ACTION_DECAP;
 				}
@@ -3871,7 +3870,7 @@ static struct mlx5e_tc_flow *alloc_flow(struct mlx5e_priv *priv, gfp_t flags)
 
 	INIT_LIST_HEAD(&flow->microflow_list);
 	flow->priv = priv;
-	flow->flags = MLX5E_TC_FLOW_ESWITCH;
+	//flow->flags = MLX5E_TC_FLOW_ESWITCH;
 	flow->esw_attr->parse_attr = parse_attr;
 	return flow;
 
@@ -3979,7 +3978,7 @@ static int microflow_merge_hdr(struct mlx5e_priv *priv,
 static void microflow_merge_vxlan(struct mlx5e_tc_flow *mflow,
 				 struct mlx5e_tc_flow *flow)
 {
-	if (!(flow->esw_attr->action & MLX5_FLOW_CONTEXT_ACTION_ENCAP))
+	if (!(flow->esw_attr->action & MLX5_FLOW_CONTEXT_ACTION_PACKET_REFORMAT))
 		return;
 
 	mflow->esw_attr->parse_attr->mirred_ifindex = flow->esw_attr->parse_attr->mirred_ifindex;
@@ -4272,7 +4271,7 @@ static int __microflow_merge(struct mlx5e_microflow *microflow)
 
 	mflow->microflow = microflow;
 
-	mflow->flags |= MLX5E_TC_FLOW_SIMPLE;
+	atomic_or(MLX5E_TC_FLOW_SIMPLE, &mflow->flags);
 
 	mflow->esw_attr->in_rep = rpriv->rep;
 	mflow->esw_attr->in_mdev = priv->mdev;
@@ -4287,7 +4286,8 @@ static int __microflow_merge(struct mlx5e_microflow *microflow)
 	for (i=0; i<microflow->nr_flows; i++) {
 		flow = microflow->path.flows[i];
 
-		mflow->flags |= flow->flags;
+		/* TODO: merge change: use simple flags and set and the end */
+		atomic_or(atomic_read(&flow->flags), &mflow->flags);
 
 		microflow_merge_match(mflow, flow);
 		microflow_merge_action(mflow, flow);
@@ -4312,7 +4312,8 @@ static int __microflow_merge(struct mlx5e_microflow *microflow)
 	/* TODO: Workaround: crashes otherwise, should fix */
 	mflow->esw_attr->action = mflow->esw_attr->action & ~MLX5_FLOW_CONTEXT_ACTION_CT;
 
-	err = configure_fdb(mflow);
+	/* TODO: merge changes: fix */
+	//err = configure_fdb(mflow);
 	if (err && err != -EAGAIN)
 		goto err;
 

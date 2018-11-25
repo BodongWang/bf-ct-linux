@@ -41,12 +41,14 @@ static void ct_notify_underlying_device(struct sk_buff *skb, struct nf_conn *ct,
 {
 	struct tc_ct_offload cto = { skb, net, NULL, NULL };
 	if (ct) {
-		cto.zone = nf_ct_zone(ct);
+		cto.zone = (struct nf_conntrack_zone *)nf_ct_zone(ct);
 		cto.tuple = nf_ct_tuple(ct, CTINFO2DIR(ctinfo));
 	}
 
 	/* TODO: do we want tuple as a cookie? */
-	tc_setup_cb_call(NULL, NULL, TC_SETUP_CT, &cto, false);
+	tc_setup_cb_call(NULL, NULL, TC_SETUP_CT,
+			 &cto, false, false, NULL, NULL,
+			 TC_BLOCK_OFFLOADCNT_NOOP);
 }
 
 static int tcf_conntrack(struct sk_buff *skb, const struct tc_action *a,
@@ -60,6 +62,12 @@ static int tcf_conntrack(struct sk_buff *skb, const struct tc_action *a,
 	struct nf_conn *ct;
 	int nh_ofs;
 	int err, ret = 0;
+
+	struct nf_hook_state state = {
+		.hook = NF_INET_PRE_ROUTING,
+		.pf = PF_INET,
+		.net = net,
+	};
 
 	/* The conntrack module expects to be working at L3. */
 	nh_ofs = skb_network_offset(skb);
@@ -84,8 +92,7 @@ static int tcf_conntrack(struct sk_buff *skb, const struct tc_action *a,
 
 	__set_bit(IPS_CONFIRMED_BIT, &tmpl->status);
 
-	err = nf_conntrack_in(net, PF_INET,
-			      NF_INET_PRE_ROUTING, skb);
+	err = nf_conntrack_in(skb, &state);
 	if (err != NF_ACCEPT) {
 		etrace("tcf_conntrack: nf_conntrack_in failed: %d", err);
 		ret = -1;
@@ -195,7 +202,7 @@ static const struct nla_policy conntrack_policy[TCA_CONNTRACK_MAX + 1] = {
 
 static int tcf_conntrack_init(struct net *net, struct nlattr *nla,
 			     struct nlattr *est, struct tc_action **a,
-			     int ovr, int bind,
+			     int ovr, int bind, bool rtnl_held,
 			     struct netlink_ext_ack *extack)
 {
 	struct tc_action_net *tn = net_generic(net, conntrack_net_id);
@@ -217,11 +224,14 @@ static int tcf_conntrack_init(struct net *net, struct nlattr *nla,
 
 	parm = nla_data(tb[TCA_CONNTRACK_PARMS]);
 
-	if (!tcf_idr_check(tn, parm->index, a, bind)) {
+	ret = tcf_idr_check_alloc(tn, &parm->index, a, bind);
+	if (!ret) {
 		ret = tcf_idr_create(tn, parm->index, est, a,
 				     &act_conntrack_ops, bind, false);
-		if (ret)
+		if (ret) {
+			tcf_idr_cleanup(tn, parm->index);
 			return ret;
+		}
 
 		ci = to_conntrack(*a);
 		ci->tcf_action = parm->action;
@@ -235,7 +245,7 @@ static int tcf_conntrack_init(struct net *net, struct nlattr *nla,
 
 		tcf_idr_insert(tn, *a);
 		ret = ACT_P_CREATED;
-	} else {
+	} else if (ret > 0) {
 		mtrace("Replacing CT action");
 		ci = to_conntrack(*a);
 		if (bind)
@@ -244,8 +254,11 @@ static int tcf_conntrack_init(struct net *net, struct nlattr *nla,
 		if (!ovr)
 			return -EEXIST;
 		/* replacing action and zone */
+		spin_lock_bh(&ci->tcf_lock);
 		ci->tcf_action = parm->action;
 		ci->zone = parm->zone;
+		spin_unlock_bh(&ci->tcf_lock);
+		ret = 0;
 	}
 
 	return ret;
@@ -259,17 +272,19 @@ static inline int tcf_conntrack_dump(struct sk_buff *skb, struct tc_action *a,
 
 	struct tc_conntrack opt = {
 		.index   = ci->tcf_index,
-		.refcnt  = ci->tcf_refcnt - ref,
-		.bindcnt = ci->tcf_bindcnt - bind,
-		.action  = ci->tcf_action,
-		.zone   = ci->zone,
-		.commit = ci->commit,
-		.mark = ci->mark,
-		.mark_mask = ci->mark_mask,
+		.refcnt  = refcount_read(&ci->tcf_refcnt) - ref,
+		.bindcnt = atomic_read(&ci->tcf_bindcnt) - bind,
 	};
 	struct tcf_t t;
 
-	memcpy(opt.labels, ci->labels, sizeof(opt.labels));
+ 	spin_lock_bh(&ci->tcf_lock);
+	opt.action  = ci->tcf_action,
+	opt.zone   = ci->zone,
+	opt.commit = ci->commit,
+	opt.mark = ci->mark,
+	opt.mark_mask = ci->mark_mask,
+
+ 	memcpy(opt.labels, ci->labels, sizeof(opt.labels));
 	memcpy(opt.labels_mask, ci->labels_mask, sizeof(opt.labels_mask));
 
 	if (nla_put(skb, TCA_CONNTRACK_PARMS, sizeof(opt), &opt))
@@ -279,9 +294,11 @@ static inline int tcf_conntrack_dump(struct sk_buff *skb, struct tc_action *a,
 	if (nla_put_64bit(skb, TCA_CONNTRACK_TM, sizeof(t), &t,
 			  TCA_CONNTRACK_PAD))
 		goto nla_put_failure;
+	spin_unlock_bh(&ci->tcf_lock);
 
 	return skb->len;
 nla_put_failure:
+	spin_unlock_bh(&ci->tcf_lock);
 	nlmsg_trim(skb, b);
 	return -1;
 }
@@ -296,8 +313,7 @@ static int tcf_conntrack_walker(struct net *net, struct sk_buff *skb,
 	return tcf_generic_walker(tn, skb, cb, type, ops, extack);
 }
 
-static int tcf_conntrack_search(struct net *net, struct tc_action **a, u32 index,
-			       struct netlink_ext_ack *extack)
+static int tcf_conntrack_search(struct net *net, struct tc_action **a, u32 index)
 {
 	struct tc_action_net *tn = net_generic(net, conntrack_net_id);
 

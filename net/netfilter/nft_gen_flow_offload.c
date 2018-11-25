@@ -261,26 +261,20 @@ err_ct_refcnt:
 static void nf_gen_flow_offload_fixup_ct_state(struct nf_conn *ct)
 {
     const struct nf_conntrack_l4proto *l4proto;
-    struct net *net = nf_ct_net(ct);
-    unsigned int *timeouts;
     unsigned int timeout;
     int l4num;
 
     l4num = nf_ct_protonum(ct);
-    l4proto = __nf_ct_l4proto_find(nf_ct_l3num(ct), l4num);
+    l4proto = __nf_ct_l4proto_find(l4num);
     if (!l4proto)
-        return;
-
-    timeouts = l4proto->get_timeouts(net);
-    if (!timeouts)
         return;
 
     /* FIXME, This is not safe way, since tcp state may be changed during this update */
     if (l4num == IPPROTO_TCP) {
-        timeout = timeouts[ct->proto.tcp.state];
+        timeout = 30 * HZ;
     }
     else if (l4num == IPPROTO_UDP)
-        timeout = timeouts[UDP_CT_REPLIED];
+        timeout = 30 * HZ;
     else
         return;
 
@@ -582,7 +576,8 @@ static inline int _get_bucket_id_of_flow(struct flow_gc_work *gc_work,
         
         if (tgt_bucket >= gc_work->bucket_num) 
             tgt_bucket = gc_work->bucket_num - 1;
-    } else {
+    
+} else {
         /* abnormal, add into temp */
         tgt_bucket = 0;
     }
