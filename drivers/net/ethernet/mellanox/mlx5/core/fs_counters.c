@@ -202,7 +202,7 @@ out:
 static void mlx5_free_fc(struct mlx5_core_dev *dev,
 			 struct mlx5_fc *counter)
 {
-	if (!counter->dummy) {
+	if (!counter->dummy)
 		mlx5_cmd_fc_free(dev, counter->id);
 	kfree(counter);
 }
