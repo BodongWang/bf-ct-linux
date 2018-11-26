@@ -164,8 +164,6 @@ struct mlx5e_microflow {
 	} path;
 
 	struct mlx5e_microflow_node mnodes[MICROFLOW_MAX_FLOWS];
-
-	struct mlx5_fc *dummy_counters[MICROFLOW_MAX_FLOWS];
 };
 
 static const struct rhashtable_params mf_ht_params = {
@@ -1247,9 +1245,8 @@ static struct rhashtable *get_mf_ht(struct mlx5e_priv *priv)
 
 static struct mlx5_fc *mlx5e_tc_get_counter(struct mlx5e_tc_flow *flow);
 
-static void microflow_link_dummy_counters(struct mlx5e_microflow *microflow)
+static void microflow_link_dummy_counters(struct mlx5e_tc_flow *flow, struct mlx5_fc **dummies, int nr_dummies)
 {
-	struct mlx5e_tc_flow *flow = microflow->flow;
 	struct mlx5_fc *counter;
 
 	counter = mlx5e_tc_get_counter(flow);
@@ -1257,12 +1254,11 @@ static void microflow_link_dummy_counters(struct mlx5e_microflow *microflow)
 		return;
 
 	WARN_ON(counter->dummy);
-	mlx5_fc_link_dummies(counter, microflow->dummy_counters, microflow->nr_flows);
+	mlx5_fc_link_dummies(counter, dummies, nr_dummies);
 }
 
-static void microflow_unlink_dummy_counters(struct mlx5e_microflow *microflow)
+static void microflow_unlink_dummy_counters(struct mlx5e_tc_flow *flow)
 {
-	struct mlx5e_tc_flow *flow = microflow->flow;
 	struct mlx5_fc *counter;
 
 	counter = mlx5e_tc_get_counter(flow);
@@ -1293,7 +1289,7 @@ static void __mlx5e_tc_del_microflow(struct mlx5e_microflow *microflow);
 
 static void mlx5e_tc_del_microflow(struct mlx5e_microflow *microflow)
 {
-	microflow_unlink_dummy_counters(microflow);
+	microflow_unlink_dummy_counters(microflow->flow);
 	microflow_detach(microflow);
 
 	__mlx5e_tc_del_microflow(microflow);
@@ -1333,7 +1329,7 @@ static void mlx5e_tc_del_microflow_list(struct mlx5e_tc_flow *flow)
 	list_for_each_entry_safe(mnode, n, &flow->microflow_list, node) {
 		struct mlx5e_microflow *microflow = mnode->microflow;
 
-		microflow_unlink_dummy_counters(microflow);
+		microflow_unlink_dummy_counters(microflow->flow);
 		microflow_detach(microflow);
 
 		INIT_WORK(&microflow->work, mlx5e_tc_del_microflow_work);
@@ -4324,13 +4320,13 @@ err:
 
 static int __microflow_merge(struct mlx5e_microflow *microflow)
 {
-	struct mlx5e_tc_flow_parse_attr *parse_attr;
+	struct mlx5_fc *dummy_counters[MICROFLOW_MAX_FLOWS];
+	struct mlx5e_tc_flow_parse_attr *mparse_attr;
 	struct mlx5e_priv *priv = microflow->priv;
 	struct rhashtable *mf_ht = get_mf_ht(priv);
 	struct mlx5e_rep_priv *rpriv = priv->ppriv;
 	struct mlx5e_tc_flow *mflow;
 	struct mlx5e_tc_flow *flow;
-	struct mlx5_fc *counter;
 	int flags = MLX5E_TC_FLOW_ESWITCH | MLX5E_TC_FLOW_SIMPLE;
 	int attr_size;
 	int i;
@@ -4339,22 +4335,22 @@ static int __microflow_merge(struct mlx5e_microflow *microflow)
 	/* check that all flows are active and init and ready */
 
 
-	/* RCU is held, check all flows are ok */	
+	/* RCU is held, check all flows are ok; they are if found in the tc_ht */
 	/* spin_lock to protect node list ? */
-	
+
 	err = microflow_resolve_path_flows(microflow);
 	if (err)
 		goto err_flow;
 
 	attr_size = sizeof(struct mlx5_esw_flow_attr);
 	err = mlx5e_alloc_flow(priv, attr_size, 0 /* cookie */, flags,
-			       GFP_KERNEL, &parse_attr, &mflow);
+			       GFP_KERNEL, &mparse_attr, &mflow);
 	if (err)
 		goto err_flow;
 
 	microflow->flow = mflow;
 
-	mflow->esw_attr->parse_attr = parse_attr;
+	mflow->esw_attr->parse_attr = mparse_attr;
 	mflow->microflow = microflow;
 
 	mflow->esw_attr->in_rep = rpriv->rep;
@@ -4377,12 +4373,12 @@ static int __microflow_merge(struct mlx5e_microflow *microflow)
 		microflow_merge_vxlan(mflow, flow);
 		/* TODO: vlan? */
 
-		/* TODO: refactor; change name */
-		counter = microflow_get_dummy_counter(flow);
-		if (!counter)
-			goto err;
-		microflow->dummy_counters[i] = counter;
-		/* TODO: assumption: all parent flows has MLX5_FLOW_CONTEXT_ACTION_COUNT set */
+		// /* TODO: refactor; change name */
+		// /* TODO: assumption: all parent flows have MLX5_FLOW_CONTEXT_ACTION_COUNT set */
+		// counter = microflow_get_dummy_counter(flow);
+		//if (!counter)
+		//	goto err;
+		dummy_counters[i] = flow->esw_attr->counter;
 	}
 
 	atomic_set(&flow->flags, flags);
@@ -4396,7 +4392,7 @@ static int __microflow_merge(struct mlx5e_microflow *microflow)
 	/* TODO: merge changes: fix */
 	//err = configure_fdb(mflow);
 	/* TODO: should take the switchdev mode lock; follow Vlad's code */
-	err = mlx5e_tc_add_fdb_flow(priv, mflow->esw_attr->parse_attr, mflow, NULL);
+	err = mlx5e_tc_add_fdb_flow(priv, mparse_attr, mflow, NULL);
 	trace("mlx5e_tc_add_fdb_flow: err: %d", err);
 	if (err)
 		goto err;
@@ -4404,7 +4400,9 @@ static int __microflow_merge(struct mlx5e_microflow *microflow)
 	//if (err && err != -EAGAIN)
 	//	goto err;
 
-	microflow_link_dummy_counters(microflow);
+	microflow_link_dummy_counters(microflow->flow,
+				      dummy_counters,
+				      microflow->nr_flows);
 	microflow_attach(microflow);
 
 	/* TOOD: microflow with VXLAN might be removed from HW, what about ct_flow offload? */
@@ -4421,8 +4419,8 @@ static int __microflow_merge(struct mlx5e_microflow *microflow)
 	return 0;
 
 err:
-	kfree(mflow->esw_attr->parse_attr->mod_hdr_actions);
-	kvfree(mflow->esw_attr->parse_attr);
+	kfree(mparse_attr->mod_hdr_actions);
+	kvfree(mparse_attr);
 	kfree(mflow);
 err_flow:
 	rhashtable_remove_fast(mf_ht, &microflow->node, mf_ht_params);

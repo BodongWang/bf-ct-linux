@@ -115,12 +115,15 @@ static void fc_dummies_update(struct mlx5_fc *counter,
 			      u64 dfpackets, u64 dfbytes, u64 jiffies)
 {
 	int nr_dummies = atomic_read(&counter->nr_dummies);
+	struct mlx5_fc_cache *c;
 	int i;
 
 	for (i = 0; i < nr_dummies; i++) {
-		struct mlx5_fc *s = counter->dummies[i];
-		struct mlx5_fc_cache *c = &s->cache;
+		struct mlx5_fc *dummy = counter->dummies[i];
+		if (!dummy)
+			continue;
 
+		c = &dummy->cache;
 		c->packets += dfpackets;
 		c->bytes += dfbytes;
 		c->lastuse = jiffies;
@@ -307,14 +310,15 @@ EXPORT_SYMBOL(mlx5_fc_id);
 
 void mlx5_fc_link_dummies(struct mlx5_fc *counter, struct mlx5_fc **dummies, int nr_dummies)
 {
-	WRITE_ONCE(counter->dummies, dummies);
+	/* TODO: fix this */
+	BUG_ON(nr_dummies > MICROFLOW_MAX_FLOWS);
+	memcpy(counter->dummies, dummies, sizeof(*dummies) * nr_dummies);
 	atomic_set(&counter->nr_dummies, nr_dummies);
 }
 
 void mlx5_fc_unlink_dummies(struct mlx5_fc *counter)
 {
 	atomic_set(&counter->nr_dummies, 0);
-	WRITE_ONCE(counter->dummies, NULL);
 }
 
 void mlx5_fc_destroy(struct mlx5_core_dev *dev, struct mlx5_fc *counter)
