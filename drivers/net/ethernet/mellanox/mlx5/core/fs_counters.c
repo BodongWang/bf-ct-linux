@@ -114,12 +114,16 @@ static void mlx5_fc_stats_remove(struct mlx5_core_dev *dev,
 static void fc_dummies_update(struct mlx5_fc *counter,
 			      u64 dfpackets, u64 dfbytes, u64 jiffies)
 {
+	int nr_dummies = atomic_read(&counter->nr_dummies);
+	struct mlx5_fc_cache *c;
 	int i;
 
-	for (i = 0; i < counter->nf_dummies; i++) {
-		struct mlx5_fc *s = counter->dummies[i];
-		struct mlx5_fc_cache *c = &s->cache;
+	for (i = 0; i < nr_dummies; i++) {
+		struct mlx5_fc *dummy = counter->dummies[i];
+		if (!dummy)
+			continue;
 
+		c = &dummy->cache;
 		c->packets += dfpackets;
 		c->bytes += dfbytes;
 		c->lastuse = jiffies;
@@ -202,8 +206,7 @@ out:
 static void mlx5_free_fc(struct mlx5_core_dev *dev,
 			 struct mlx5_fc *counter)
 {
-	if (!counter->dummy)
-		mlx5_cmd_fc_free(dev, counter->id);
+	mlx5_cmd_fc_free(dev, counter->id);
 	kfree(counter);
 }
 
@@ -228,8 +231,13 @@ static void mlx5_fc_stats_work(struct work_struct *work)
 		mlx5_fc_stats_insert(dev, counter);
 
 	llist_for_each_entry_safe(counter, tmp, dellist, dellist) {
-		mlx5_fc_stats_remove(dev, counter);
+		/* TODO: merge change */
+		if (counter->dummy) {
+			kfree(counter);
+			continue;
+		}
 
+		mlx5_fc_stats_remove(dev, counter);
 		mlx5_free_fc(dev, counter);
 	}
 
@@ -300,18 +308,17 @@ u32 mlx5_fc_id(struct mlx5_fc *counter)
 }
 EXPORT_SYMBOL(mlx5_fc_id);
 
-void mlx5_fc_link_dummies(struct mlx5_fc *counter, struct mlx5_fc **dummies, int nf_dummies)
+void mlx5_fc_link_dummies(struct mlx5_fc *counter, struct mlx5_fc **dummies, int nr_dummies)
 {
-	/* TODO: use memory barrier, is the following correct? */
-	WRITE_ONCE(counter->dummies, dummies);
-	WRITE_ONCE(counter->nf_dummies, nf_dummies);
+	/* TODO: fix this */
+	BUG_ON(nr_dummies > MICROFLOW_MAX_FLOWS);
+	memcpy(counter->dummies, dummies, sizeof(*dummies) * nr_dummies);
+	atomic_set(&counter->nr_dummies, nr_dummies);
 }
 
 void mlx5_fc_unlink_dummies(struct mlx5_fc *counter)
 {
-	WRITE_ONCE(counter->nf_dummies, 0);
-	smp_wmb();
-	WRITE_ONCE(counter->dummies, NULL);
+	atomic_set(&counter->nr_dummies, 0);
 }
 
 void mlx5_fc_destroy(struct mlx5_core_dev *dev, struct mlx5_fc *counter)

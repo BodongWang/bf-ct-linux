@@ -210,9 +210,9 @@ int tc_setup_cb_egdev_call(const struct net_device *dev,
 			   bool err_stop, bool rtnl_held);
 /* TODO: workaround */
 int tc_setup_cb_egdev_all_register(const struct net_device *dev,
-				   tc_setup_cb_t *cb, void *cb_priv);
+				   tc_setup_cb_unlocked_t *cb, void *cb_priv);
 void tc_setup_cb_egdev_all_unregister(const struct net_device *dev,
-				      tc_setup_cb_t *cb, void *cb_priv);
+				      tc_setup_cb_unlocked_t *cb, void *cb_priv);
 int tc_setup_cb_egdev_all_call(enum tc_setup_type type, void *type_data);
 #else
 static inline

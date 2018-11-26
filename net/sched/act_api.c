@@ -1772,7 +1772,7 @@ int tc_setup_cb_egdev_register_unlocked(const struct net_device *dev,
 EXPORT_SYMBOL_GPL(tc_setup_cb_egdev_register_unlocked);
 
 int tc_setup_cb_egdev_all_register(const struct net_device *dev,
-				   tc_setup_cb_t *cb, void *cb_priv)
+				   tc_setup_cb_unlocked_t *cb, void *cb_priv)
 {
 	struct tcf_action_egdev_cb *egdev_cb;
 	struct tcf_action_net *tan;
@@ -1780,7 +1780,7 @@ int tc_setup_cb_egdev_all_register(const struct net_device *dev,
 	egdev_cb = kzalloc(sizeof(*egdev_cb), GFP_KERNEL);
 	if (!egdev_cb)
 		return -ENOMEM;
-	egdev_cb->cb = cb;
+	egdev_cb->cb_unlocked = cb;
 	egdev_cb->cb_priv = cb_priv;
 
 	rtnl_lock();
@@ -1792,7 +1792,7 @@ int tc_setup_cb_egdev_all_register(const struct net_device *dev,
 EXPORT_SYMBOL_GPL(tc_setup_cb_egdev_all_register);
 
 void tc_setup_cb_egdev_all_unregister(const struct net_device *dev,
-				      tc_setup_cb_t *cb, void *cb_priv)
+				      tc_setup_cb_unlocked_t *cb, void *cb_priv)
 {
 	struct tcf_action_egdev_cb *egdev_cb;
 	struct tcf_action_net *tan;
@@ -1800,7 +1800,7 @@ void tc_setup_cb_egdev_all_unregister(const struct net_device *dev,
 	rtnl_lock();
 	tan = net_generic(dev_net(dev), tcf_action_net_id);
 	list_for_each_entry(egdev_cb, &tan->egdev_list, list) {
-		if (egdev_cb->cb == cb && egdev_cb->cb_priv == cb_priv) {
+		if (egdev_cb->cb_unlocked == cb && egdev_cb->cb_priv == cb_priv) {
 			list_del(&egdev_cb->list);
 			kfree(egdev_cb);
 			break;
@@ -1858,9 +1858,10 @@ int tc_setup_cb_egdev_all_call(enum tc_setup_type type, void *type_data)
 	struct tcf_action_net *tan = net_generic(&init_net, tcf_action_net_id);
 	struct tcf_action_egdev_cb *egdev_cb;
 	int err;
-
+	
 	list_for_each_entry(egdev_cb, &tan->egdev_list, list) {
-		err = egdev_cb->cb(type, type_data, egdev_cb->cb_priv);
+		/* TODO: merge change */
+		err = egdev_cb->cb_unlocked(type, type_data, egdev_cb->cb_priv, true);
 		if (!err)
 			return 1;
 	}
