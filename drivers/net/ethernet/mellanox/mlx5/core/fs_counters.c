@@ -114,9 +114,10 @@ static void mlx5_fc_stats_remove(struct mlx5_core_dev *dev,
 static void fc_dummies_update(struct mlx5_fc *counter,
 			      u64 dfpackets, u64 dfbytes, u64 jiffies)
 {
+	int nr_dummies = atomic_read(&counter->nr_dummies);
 	int i;
 
-	for (i = 0; i < counter->nr_dummies; i++) {
+	for (i = 0; i < nr_dummies; i++) {
 		struct mlx5_fc *s = counter->dummies[i];
 		struct mlx5_fc_cache *c = &s->cache;
 
@@ -306,15 +307,13 @@ EXPORT_SYMBOL(mlx5_fc_id);
 
 void mlx5_fc_link_dummies(struct mlx5_fc *counter, struct mlx5_fc **dummies, int nr_dummies)
 {
-	/* TODO: use memory barrier, is the following correct? */
 	WRITE_ONCE(counter->dummies, dummies);
-	WRITE_ONCE(counter->nr_dummies, nr_dummies);
+	atomic_set(&counter->nr_dummies, nr_dummies);
 }
 
 void mlx5_fc_unlink_dummies(struct mlx5_fc *counter)
 {
-	WRITE_ONCE(counter->nr_dummies, 0);
-	smp_wmb();
+	atomic_set(&counter->nr_dummies, 0);
 	WRITE_ONCE(counter->dummies, NULL);
 }
 

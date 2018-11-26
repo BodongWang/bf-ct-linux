@@ -166,7 +166,7 @@ struct mlx5_fc {
 	bool aging;
 	bool dummy;
 
-	int nr_dummies;
+	atomic_t nr_dummies;
 	struct mlx5_fc **dummies;
 
 	struct mlx5_fc_cache cache ____cacheline_aligned_in_smp;
