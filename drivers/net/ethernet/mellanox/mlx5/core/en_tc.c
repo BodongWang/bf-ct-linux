@@ -282,6 +282,11 @@ static bool mlx5e_is_offloaded_flow(struct mlx5e_tc_flow *flow)
 	return !!(atomic_read(&flow->flags) & MLX5E_TC_FLOW_OFFLOADED);
 }
 
+static bool mlx5e_is_simple_flow(struct mlx5e_tc_flow *flow)
+{
+	return !!(atomic_read(&flow->flags) & MLX5E_TC_FLOW_SIMPLE);
+}
+
 static inline u32 hash_mod_hdr_info(struct mod_hdr_key *key)
 {
 	return jhash(key->actions,
@@ -1378,7 +1383,7 @@ static void mlx5e_tc_del_fdb_flow(struct mlx5e_priv *priv,
 
 	trace("mlx5e_tc_del_fdb_flow");
 
-	if (atomic_read(&flow->flags) & MLX5E_TC_FLOW_SIMPLE) {
+	if (mlx5e_is_simple_flow(flow)) {
 		__mlx5e_tc_del_fdb_flow(priv, flow);
 	} else {
 		mlx5e_tc_del_microflow_list(flow);
@@ -1388,10 +1393,10 @@ static void mlx5e_tc_del_fdb_flow(struct mlx5e_priv *priv,
 		mlx5_fc_destroy(priv->mdev, flow->dummy_counter);
 
 		/* TODO: merge change: that IF is needed in 4.20 */
-		if (!attr->parse_attr) {
-			etrace("attr->parse_attr == NULL !!!");
-			return;
-		}
+		//if (!attr->parse_attr) {
+		//	etrace("attr->parse_attr == NULL !!!");
+		//	return;
+		//}
 
 		/* TODO: ?? */
 		// if (attr->action & MLX5_FLOW_CONTEXT_ACTION_MOD_HDR)
@@ -3784,7 +3789,7 @@ mlx5e_add_fdb_flow(struct mlx5e_priv *priv,
 	 */
 	mlx5_eswitch_read_lock_mode(esw);
 
-	flow_flags |= MLX5E_TC_FLOW_ESWITCH;
+	flow_flags |= MLX5E_TC_FLOW_SIMPLE | MLX5E_TC_FLOW_ESWITCH;
 	attr_size  = sizeof(struct mlx5_esw_flow_attr);
 	err = mlx5e_alloc_flow(priv, attr_size, f->cookie, flow_flags, GFP_KERNEL,
 			       &parse_attr, &flow);
@@ -3803,11 +3808,12 @@ mlx5e_add_fdb_flow(struct mlx5e_priv *priv,
 
 	if (is_flow_simple(flow, f->common.chain_index)) {
 		trace("is_flow_simple(flow): %px", flow);
-		atomic_or(MLX5E_TC_FLOW_SIMPLE, &flow->flags);
 
 		err = mlx5e_tc_add_fdb_flow(priv, parse_attr, flow, extack);
 		if (err)
 			goto err_free;
+	} else {
+		atomic_and(~MLX5E_TC_FLOW_SIMPLE, &flow->flags);
 	}
 
 	mlx5_eswitch_read_unlock_mode(esw);
@@ -4144,23 +4150,37 @@ static void microflow_merge_tuple(struct mlx5e_tc_flow *mflow,
 	}
 }
 
-struct mlx5_fc *microflow_get_dummy_counter(struct mlx5e_tc_flow *flow)
+/* TODO: refactor mlx5_fc_create() and reuse */
+static struct mlx5_fc *microflow_alloc_dummy_counter(void)
 {
 	struct mlx5_fc *counter;
-
-	if (flow->dummy_counter)
-		return flow->dummy_counter;
 
 	counter = kzalloc(sizeof(*counter), GFP_KERNEL);
 	if (!counter)
 		return NULL;
 
-	flow->dummy_counter = counter;
-
 	counter->dummy = true;
 	counter->aging = true;
 
 	return counter;
+}
+
+static int microflow_attach_dummy_counter(struct mlx5e_tc_flow *flow)
+{
+	struct mlx5_fc *counter;
+
+	if (flow->dummy_counter)
+		return 0;
+
+	if (flow->esw_attr->action & MLX5_FLOW_CONTEXT_ACTION_COUNT) {
+		counter = microflow_alloc_dummy_counter();
+		if (!counter)
+			return -1;
+
+		flow->dummy_counter = counter;
+	}
+
+	return 0;
 }
 
 static struct mlx5e_microflow *microflow_alloc(void)
@@ -4325,15 +4345,12 @@ static int __microflow_merge(struct mlx5e_microflow *microflow)
 	struct mlx5e_priv *priv = microflow->priv;
 	struct rhashtable *mf_ht = get_mf_ht(priv);
 	struct mlx5e_rep_priv *rpriv = priv->ppriv;
-	struct mlx5e_tc_flow *mflow;
-	struct mlx5e_tc_flow *flow;
-	int flags = MLX5E_TC_FLOW_ESWITCH | MLX5E_TC_FLOW_SIMPLE;
-	int attr_size;
-	int i;
+	struct mlx5e_tc_flow *mflow, *flow;
+	int flags = MLX5E_TC_FLOW_SIMPLE | MLX5E_TC_FLOW_ESWITCH;
+	int attr_size, i;
 	int err;
 
 	/* check that all flows are active and init and ready */
-
 
 	/* RCU is held, check all flows are ok; they are if found in the tc_ht */
 	/* spin_lock to protect node list ? */
@@ -4371,14 +4388,12 @@ static int __microflow_merge(struct mlx5e_microflow *microflow)
 		if (err)
 			goto err;
 		microflow_merge_vxlan(mflow, flow);
-		/* TODO: vlan? */
+		/* TODO: vlan is not supported yet */
 
-		// /* TODO: refactor; change name */
-		// /* TODO: assumption: all parent flows have MLX5_FLOW_CONTEXT_ACTION_COUNT set */
-		// counter = microflow_get_dummy_counter(flow);
-		//if (!counter)
-		//	goto err;
-		dummy_counters[i] = flow->esw_attr->counter;
+		err = microflow_attach_dummy_counter(flow);
+		if (err)
+			goto err;
+		dummy_counters[i] = flow->dummy_counter;
 	}
 
 	atomic_set(&flow->flags, flags);
@@ -4683,7 +4698,7 @@ int mlx5e_delete_flower(struct mlx5e_priv *priv,
 
 	/* TODO: introduce a function to check for simple flow */
 	/* To protect __microflow_merge() */
-	if (!(atomic_read(&flow->flags) & MLX5E_TC_FLOW_SIMPLE))
+	if (!mlx5e_is_simple_flow(flow))
 		synchronize_rcu();
 
 	mlx5e_flow_put(priv, flow);
