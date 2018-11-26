@@ -2301,17 +2301,24 @@ static int tc_exts_setup_cb_egdev_call(struct tcf_exts *exts,
 	return ok_count;
 }
 
+#include <linux/yktrace.h>
+
 int tc_setup_cb_call(struct tcf_block *block, struct tcf_exts *exts,
 		     enum tc_setup_type type, void *type_data, bool err_stop)
 {
 	int ok_count;
 	int ret;
 
+	dump_stack();
+
+	trace("tc_setup_cb_call: type: %d (exts: %px)", type, exts);
+
 	/* TODO: temporary workaround */
 	if (!block)
 		goto egdev_all;
 
 	ret = tcf_block_cb_call(block, type, type_data, err_stop);
+	trace("tcf_block_cb_call: ret: %d", ret);
 	if (ret < 0)
 		return ret;
 	ok_count = ret;
@@ -2319,6 +2326,7 @@ int tc_setup_cb_call(struct tcf_block *block, struct tcf_exts *exts,
 	if (!exts || ok_count)
 		return ok_count;
 	ret = tc_exts_setup_cb_egdev_call(exts, type, type_data, err_stop);
+	trace("tc_exts_setup_cb_egdev_call: ret: %d", ret);
 	if (ret < 0)
 		return ret;
 	ok_count += ret;
