@@ -221,7 +221,10 @@ int tc_setup_cb_egdev_all_register(const struct net_device *dev,
 				   tc_setup_cb_unlocked_t *cb, void *cb_priv);
 void tc_setup_cb_egdev_all_unregister(const struct net_device *dev,
 				      tc_setup_cb_unlocked_t *cb, void *cb_priv);
-int tc_setup_cb_egdev_all_call(enum tc_setup_type type, void *type_data);
+int tc_setup_cb_egdev_all_call(struct tcf_block *block, enum tc_setup_type type,
+			       void *type_data, bool rtnl_held,
+			       u32 *flags, spinlock_t *flags_lock,
+			       enum tc_block_update_offloadcnt update_count);
 #else
 static inline
 int tc_setup_cb_egdev_register(const struct net_device *dev,
@@ -273,7 +276,10 @@ static inline void tc_setup_cb_egdev_all_unregister(const struct net_device *dev
 }
 
 static inline
-int tc_setup_cb_egdev_all_call(enum tc_setup_type type, void *type_data)
+int tc_setup_cb_egdev_all_call(struct tcf_block *block, enum tc_setup_type type,
+			       void *type_data, bool rtnl_held,
+			       u32 *flags, spinlock_t *flags_lock,
+			       enum tc_block_update_offloadcnt update_count)
 {
 	return 0;
 }
