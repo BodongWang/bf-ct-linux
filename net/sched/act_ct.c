@@ -47,7 +47,7 @@ static void ct_notify_underlying_device(struct sk_buff *skb, struct nf_conn *ct,
 
 	/* TODO: do we want tuple as a cookie? */
 	tc_setup_cb_call(NULL, NULL, TC_SETUP_CT,
-			 &cto, false, false, NULL, NULL,
+			 &cto, false /* TODO: true? */, false, NULL, NULL,
 			 TC_BLOCK_OFFLOADCNT_NOOP);
 }
 
