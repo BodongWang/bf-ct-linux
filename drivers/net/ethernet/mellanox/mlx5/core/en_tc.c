@@ -4413,7 +4413,7 @@ static int __microflow_merge(struct mlx5e_microflow *microflow)
 		dummy_counters[i] = flow->dummy_counter;
 	}
 
-	atomic_set(&flow->flags, flags);
+	atomic_set(&mflow->flags, flags);
 
 	microflow_merge_tuple(mflow, &microflow->tuple);
 
