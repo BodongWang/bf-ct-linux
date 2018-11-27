@@ -1445,6 +1445,7 @@ retry_locked:
 	 * unlocked.
 	 */
 	if (!rtnl_held && tcf_block_cb_needs_rtnl(block)) {
+		/* TODO: seems there is a bug: offloads_lock is up_read() at the end once more */
 		up_read(&block->offloads_lock);
 		needs_rtnl = true;
 		rtnl_held = true;
