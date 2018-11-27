@@ -1756,16 +1756,12 @@ int tc_setup_cb_egdev_call(const struct net_device *dev,
 }
 EXPORT_SYMBOL_GPL(tc_setup_cb_egdev_call);
 
-#include <linux/yktrace.h>
-
 int tc_setup_cb_egdev_all_call(enum tc_setup_type type, void *type_data)
 {
 	struct tcf_action_net *tan = net_generic(&init_net, tcf_action_net_id);
 	struct tcf_action_egdev_cb *egdev_cb;
 	int err;
 	
-	trace("tc_setup_cb_egdev_all_call");
-
 	list_for_each_entry(egdev_cb, &tan->egdev_list, list) {
 		/* TODO: merge change */
 		err = egdev_cb->cb_unlocked(type, type_data, egdev_cb->cb_priv, true);

@@ -63,8 +63,6 @@
 
 /* TODO: there is a circular dep between mlx5_core and nft_gen_flow_offload ??? */
 
-static DEFINE_SPINLOCK(microflow_lock);
-
 static int enable_ct_ageing = 1; /* On by default */
 module_param(enable_ct_ageing, int, 0644);
 
@@ -119,11 +117,9 @@ struct mlx5e_tc_flow {
 
 	struct list_head        microflow_list;
 
-	struct mlx5_ct_tuple    *ct_tuple;
-
 	/* TODO: temp */
+	struct mlx5_ct_tuple    *ct_tuple;
 	struct list_head ct;
-	struct work_struct work;
 
 	union {
 		struct mlx5_esw_flow_attr esw_attr[0];
@@ -133,6 +129,8 @@ struct mlx5e_tc_flow {
 };
 
 DEFINE_PER_CPU(struct mlx5e_microflow *, current_microflow) = NULL;
+
+static DEFINE_SPINLOCK(microflow_lock);
 
 /* TOOD: we should init this variable only once, rather than per PF? */
 /* we should have a microflow init/cleanup functions */
@@ -995,7 +993,6 @@ mlx5e_tc_add_nic_flow(struct mlx5e_priv *priv,
 	if (attr->action & MLX5_FLOW_CONTEXT_ACTION_MOD_HDR) {
 		err = mlx5e_attach_mod_hdr(priv, flow, parse_attr);
 		flow_act.modify_id = attr->mod_hdr_id;
-		/* TODO: fix NIC code */
 		kfree(parse_attr->mod_hdr_actions);
 		if (err)
 			return err;
@@ -1273,39 +1270,33 @@ static void microflow_unlink_dummy_counters(struct mlx5e_tc_flow *flow)
 	mlx5_fc_unlink_dummies(counter);
 }
 
+static void __microflow_detach(struct mlx5e_microflow *microflow)
+{
+	int i;
+
+	/* Detach from all parent flows */
+	for (i = 0; i < microflow->nr_flows; i++)
+		list_del(&microflow->mnodes[i].node);
+}
+
+static void microflow_detach(struct mlx5e_microflow *microflow)
+{
+	spin_lock(&microflow_lock);
+	__microflow_detach(microflow);
+	spin_unlock(&microflow_lock);
+}
+
 static void mlx5e_tc_del_fdb_flow(struct mlx5e_priv *priv,
 				  struct mlx5e_tc_flow *flow);
 
 static void microflow_free(struct mlx5e_microflow *microflow);
 
-static void microflow_detach(struct mlx5e_microflow *microflow)
-{
-	int i;
-
-	spin_lock_nested(&microflow_lock, SINGLE_DEPTH_NESTING);
-	/* Detach from all parent flows */
-	for (i = 0; i < microflow->nr_flows; i++)
-		list_del(&microflow->mnodes[i].node);
-	spin_unlock(&microflow_lock);
-}
-
-/* TODO: change name; remove mlx5e_tc prefix */
-static void __mlx5e_tc_del_microflow(struct mlx5e_microflow *microflow);
-
-static void mlx5e_tc_del_microflow(struct mlx5e_microflow *microflow)
-{
-	microflow_unlink_dummy_counters(microflow->flow);
-	microflow_detach(microflow);
-
-	__mlx5e_tc_del_microflow(microflow);
-}
-
-static void __mlx5e_tc_del_microflow(struct mlx5e_microflow *microflow)
+static void __mlx5e_del_microflow(struct mlx5e_microflow *microflow)
 {
 	struct rhashtable *mf_ht = get_mf_ht(microflow->priv);
 	struct mlx5e_tc_flow *flow = microflow->flow;
 
-	trace("__mlx5e_tc_del_microflow: microflow->nr_flows: %d", microflow->nr_flows);
+	trace("__mlx5e_del_microflow: microflow->nr_flows: %d", microflow->nr_flows);
 
 	/* mlx5e_flow_put(microflow->priv, microflow->flow); */
 	mlx5e_tc_del_fdb_flow(flow->priv, flow);
@@ -1315,17 +1306,22 @@ static void __mlx5e_tc_del_microflow(struct mlx5e_microflow *microflow)
 	microflow_free(microflow);
 }
 
-static void mlx5e_tc_del_microflow_work(struct work_struct *work)
+static void mlx5e_del_microflow(struct mlx5e_microflow *microflow)
+{
+	microflow_unlink_dummy_counters(microflow->flow);
+	microflow_detach(microflow);
+
+	__mlx5e_del_microflow(microflow);
+}
+
+static void mlx5e_del_microflow_work(struct work_struct *work)
 {
 	struct mlx5e_microflow *microflow = container_of(work, struct mlx5e_microflow, work);
 
-	__mlx5e_tc_del_microflow(microflow);
+	__mlx5e_del_microflow(microflow);
 }
 
-// TOOD: use the Mark coutner as a pointer to the dummy_counter, right? */
-// remove dummy_counter and use attr->counter ?
-
-static void mlx5e_tc_del_microflow_list(struct mlx5e_tc_flow *flow)
+static void mlx5e_del_microflow_list(struct mlx5e_tc_flow *flow)
 {
 	struct mlx5e_microflow_node *mnode, *n;
 	int i = 0; /* TODO: DEBUG */
@@ -1335,9 +1331,9 @@ static void mlx5e_tc_del_microflow_list(struct mlx5e_tc_flow *flow)
 		struct mlx5e_microflow *microflow = mnode->microflow;
 
 		microflow_unlink_dummy_counters(microflow->flow);
-		microflow_detach(microflow);
+		__microflow_detach(microflow);
 
-		INIT_WORK(&microflow->work, mlx5e_tc_del_microflow_work);
+		INIT_WORK(&microflow->work, mlx5e_del_microflow_work);
 		queue_work(microflow_wq, &microflow->work);
 		i++;
 	}
@@ -1347,9 +1343,8 @@ static void mlx5e_tc_del_microflow_list(struct mlx5e_tc_flow *flow)
 		mtrace("microflow_list size: %d", i);
 }
 
-/* TODO: reconsider */
-static void __mlx5e_tc_del_fdb_flow(struct mlx5e_priv *priv,
-				    struct mlx5e_tc_flow *flow)
+static void mlx5e_tc_del_fdb_flow_simple(struct mlx5e_priv *priv,
+					 struct mlx5e_tc_flow *flow)
 {
 	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
 	struct mlx5_esw_flow_attr *attr = flow->esw_attr;
@@ -1384,9 +1379,9 @@ static void mlx5e_tc_del_fdb_flow(struct mlx5e_priv *priv,
 	trace("mlx5e_tc_del_fdb_flow");
 
 	if (mlx5e_is_simple_flow(flow)) {
-		__mlx5e_tc_del_fdb_flow(priv, flow);
+		mlx5e_tc_del_fdb_flow_simple(priv, flow);
 	} else {
-		mlx5e_tc_del_microflow_list(flow);
+		mlx5e_del_microflow_list(flow);
 
 		/* TODO: make sense, right? */
 		//if (attr->action & MLX5_FLOW_CONTEXT_ACTION_COUNT)
@@ -3640,6 +3635,7 @@ static int parse_tc_fdb_actions(struct mlx5e_priv *priv, struct tcf_exts *exts,
 			int chain = tcf_gact_goto_chain_index(a);
 
 			trace("offloading chain, ignoring (goto_chain: chain: %d)", chain);
+			action |= MLX5_FLOW_CONTEXT_ACTION_COUNT;
 			continue;
 		}
 
@@ -4240,8 +4236,6 @@ static void microflow_attach(struct mlx5e_microflow *microflow)
 
 static void microflow_cleanup(struct mlx5e_microflow *microflow)
 {
-	struct mlx5e_priv *priv = microflow->priv;
-	struct rhashtable *tc_ht = get_tc_ht(priv);
 	struct mlx5e_tc_flow *flow;
 	int i;
 
@@ -4252,8 +4246,6 @@ static void microflow_cleanup(struct mlx5e_microflow *microflow)
 
 		if (!flow->ct_tuple)
 			continue;
-
-		rhashtable_remove_fast(tc_ht, &flow->node, tc_ht_params);
 
 		kfree(flow->ct_tuple);
 		kfree(flow->dummy_counter);
@@ -4305,31 +4297,17 @@ static int microflow_resolve_path_flows(struct mlx5e_microflow *microflow)
 	struct mlx5e_tc_flow *flow;
 	unsigned long cookie;
 	int i;
-	int err;
 
 	for (i = 0; i < microflow->nr_flows; i++) {
+		if (microflow->path.flows[i])
+			continue;
+
 		cookie = microflow->path.cookies[i];
 		flow = rhashtable_lookup_fast(tc_ht, &cookie, tc_ht_params);
-		if (flow) {
-			if (microflow->path.flows[i]) {
-				struct mlx5e_tc_flow *flow = microflow->path.flows[i];
-
-				kfree(flow->ct_tuple);
-				/* kfree(flow->dummy_counter); */
-				kvfree(flow->esw_attr->parse_attr);
-				kfree(flow);
-			}
-			microflow->path.flows[i] = flow;
-			continue;
-		}
-
-		flow = microflow->path.flows[i];
 		if (!flow)
 			goto err;
 
-		err = rhashtable_insert_fast(tc_ht, &flow->node, tc_ht_params);
-		if (err)
-			goto err;
+		microflow->path.flows[i] = flow;
 	}
 
 	return 0;
@@ -4349,11 +4327,6 @@ static int __microflow_merge(struct mlx5e_microflow *microflow)
 	int flags = MLX5E_TC_FLOW_SIMPLE | MLX5E_TC_FLOW_ESWITCH;
 	int attr_size, i;
 	int err;
-
-	/* check that all flows are active and init and ready */
-
-	/* RCU is held, check all flows are ok; they are if found in the tc_ht */
-	/* spin_lock to protect node list ? */
 
 	err = microflow_resolve_path_flows(microflow);
 	if (err)
@@ -4403,10 +4376,6 @@ static int __microflow_merge(struct mlx5e_microflow *microflow)
 	/* TODO: Workaround: crashes otherwise, should fix */
 	mflow->esw_attr->action = mflow->esw_attr->action & ~MLX5_FLOW_CONTEXT_ACTION_CT;
 
-
-	/* TODO: merge changes: fix */
-	//err = configure_fdb(mflow);
-	/* TODO: should take the switchdev mode lock; follow Vlad's code */
 	err = mlx5e_tc_add_fdb_flow(priv, mparse_attr, mflow, NULL);
 	trace("mlx5e_tc_add_fdb_flow: err: %d", err);
 	if (err)
@@ -4425,7 +4394,7 @@ static int __microflow_merge(struct mlx5e_microflow *microflow)
 	trace("microflow_register_ct_flow: err: %d", err);
 	if (err) {
 		etrace("microflow_register_ct_flow failed");
-		mlx5e_tc_del_microflow(microflow);
+		mlx5e_del_microflow(microflow);
 		return -1;
 	}
 
@@ -4493,7 +4462,6 @@ int mlx5e_configure_ct(struct mlx5e_priv *priv,
 	if (!cookie)
 		goto err;
 
-	/* TODO: replace with a cache */
 	ct_tuple = kzalloc(sizeof(*ct_tuple), GFP_ATOMIC);
 	if (!ct_tuple)
 		goto err;
@@ -4509,6 +4477,7 @@ int mlx5e_configure_ct(struct mlx5e_priv *priv,
 		goto err_free;
 
 	flow->esw_attr->parse_attr = parse_attr;
+	flow->esw_attr->action = MLX5_FLOW_CONTEXT_ACTION_COUNT;
 
 	flow->ct_tuple = ct_tuple;
 
@@ -4574,7 +4543,6 @@ int microflow_extract_tuple(struct mlx5e_microflow *microflow,
 		nf_tuple->dst.u.all = ports[1];
 	break;
 	case IPPROTO_ICMP:
-		/* TODO: can we support it? what is the icmp header format? */
 		ntrace("ICMP is not yet supported");
 		goto err;
 	default:
@@ -4696,8 +4664,7 @@ int mlx5e_delete_flower(struct mlx5e_priv *priv,
 	rhashtable_remove_fast(tc_ht, &flow->node, tc_ht_params);
 	mlx5e_unlock_tc_ht(priv);
 
-	/* TODO: introduce a function to check for simple flow */
-	/* To protect __microflow_merge() */
+	/* Protect __microflow_merge() */
 	if (!mlx5e_is_simple_flow(flow))
 		synchronize_rcu();
 
@@ -4872,26 +4839,11 @@ void ct_flow_offload_get_stats(struct nf_gen_flow_ct_stat *ct_stat, struct list_
 	trace("bytes: %llu, packets: %llu, lastuse: %llu", ct_stat->bytes, ct_stat->packets, ct_stat->last_used);
 }
 
-#if 0
-void ct_flow_offload_destroy_work(struct work_struct *work)
-{
-	struct mlx5e_tc_flow *flow = container_of(work, struct mlx5e_tc_flow, work);
-	struct rhashtable *tc_ht = get_tc_ht(flow->priv);
-
-	/* TODO: merge change: remove rtnl lock */
-//	rtnl_lock();
-	rhashtable_remove_fast(tc_ht, &flow->node, tc_ht_params);
-	mlx5e_tc_del_fdb_flow(flow->priv, flow);
-	kfree(flow);
-//	rtnl_unlock();
-}
-#endif
-
 void ct_flow_offload_del_flow(struct mlx5e_tc_flow *flow)
 {
-	struct rhashtable *tc_ht = get_tc_ht(flow->priv);
+	// struct rhashtable *tc_ht = get_tc_ht(flow->priv);
 
-	rhashtable_remove_fast(tc_ht, &flow->node, tc_ht_params);
+	// rhashtable_remove_fast(tc_ht, &flow->node, tc_ht_params);
 	//mlx5e_flow_put(flow->priv, flow);
 	mlx5e_tc_del_fdb_flow(flow->priv, flow);
 	kfree(flow);
@@ -4907,9 +4859,6 @@ int ct_flow_offload_destroy(struct list_head *head)
 	list_for_each_entry_safe(flow, n, head, ct) {
 		list_del(&flow->ct);
 		ct_flow_offload_del_flow(flow);
-
-		//INIT_WORK(&flow->work, ct_flow_offload_destroy_work);
-		//queue_work(microflow_wq, &flow->work);
 	}
 
 	return 0;
@@ -4971,6 +4920,7 @@ void mlx5e_tc_esw_cleanup(struct mlx5e_priv *priv)
 	int cpu;
 
 	nft_gen_flow_offload_dep_ops_unregister(&ct_offload_ops);
+	/* TODO: it does not make sense to process the remaining microflows? */
 	flush_workqueue(microflow_wq);
 	destroy_workqueue(microflow_wq);
 
