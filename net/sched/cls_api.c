@@ -2329,7 +2329,8 @@ int tc_setup_cb_call(struct tcf_block *block, struct tcf_exts *exts,
 		return ok_count;
 
 egdev_all:
-	return tc_setup_cb_egdev_all_call(type, type_data);
+	return tc_setup_cb_egdev_all_call(block, type, type_data, rtnl_held,
+					  flags, flags_lock, update_count);
 }
 EXPORT_SYMBOL(tc_setup_cb_call);
 
