@@ -12,6 +12,12 @@
 #include <net/net_namespace.h>
 #include <net/netns/generic.h>
 
+enum tc_block_update_offloadcnt {
+	TC_BLOCK_OFFLOADCNT_NOOP,
+	TC_BLOCK_OFFLOADCNT_INC,
+	TC_BLOCK_OFFLOADCNT_DEC,
+};
+
 struct tcf_idrinfo {
 	struct mutex	lock;
 	struct idr	action_idr;
@@ -205,9 +211,11 @@ void tc_setup_cb_egdev_unregister(const struct net_device *dev,
 void tc_setup_cb_egdev_unregister_unlocked(const struct net_device *dev,
 					   tc_setup_cb_unlocked_t *cb,
 					   void *cb_priv);
-int tc_setup_cb_egdev_call(const struct net_device *dev,
+int tc_setup_cb_egdev_call(struct tcf_block *block, const struct net_device *dev,
 			   enum tc_setup_type type, void *type_data,
-			   bool err_stop, bool rtnl_held);
+			   bool err_stop, bool rtnl_held,
+			   u32 *flags, spinlock_t *flags_lock,
+			   enum tc_block_update_offloadcnt update_count);
 /* TODO: workaround */
 int tc_setup_cb_egdev_all_register(const struct net_device *dev,
 				   tc_setup_cb_unlocked_t *cb, void *cb_priv);
@@ -244,9 +252,11 @@ void tc_setup_cb_egdev_unregister_unlocked(const struct net_device *dev,
 }
 
 static inline
-int tc_setup_cb_egdev_call(const struct net_device *dev,
+int tc_setup_cb_egdev_call(struct tcf_block *block, const struct net_device *dev,
 			   enum tc_setup_type type, void *type_data,
-			   bool err_stop, bool rtnl_held)
+			   bool err_stop, bool rtnl_held,
+			   u32 *flags, spinlock_t *flags_lock,
+			   enum tc_block_update_offloadcnt update_count)
 {
 	return 0;
 }
