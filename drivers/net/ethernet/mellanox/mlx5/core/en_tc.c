@@ -3841,12 +3841,13 @@ mlx5e_add_fdb_flow(struct mlx5e_priv *priv,
 		goto err_free;
 
 	if (is_flow_simple(flow, f->common.chain_index)) {
-		trace("is_flow_simple(flow): %px", flow);
+		trace("flow %px is simple", flow);
 
 		err = mlx5e_tc_add_fdb_flow(priv, parse_attr, flow, extack);
 		if (err)
 			goto err_free;
 	} else {
+		trace("flow %px is not simple", flow);
 		atomic_and(~MLX5E_TC_FLOW_SIMPLE, &flow->flags);
 	}
 
