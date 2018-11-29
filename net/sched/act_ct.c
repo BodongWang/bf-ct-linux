@@ -248,9 +248,10 @@ static int tcf_conntrack_init(struct net *net, struct nlattr *nla,
 		ci = to_conntrack(*a);
 		if (bind)
 			return 0;
-		tcf_idr_release(*a, bind);
-		if (!ovr)
+		if (!ovr) {
+			tcf_idr_release(*a, bind);
 			return -EEXIST;
+		}
 		/* replacing action and zone */
 		spin_lock_bh(&ci->tcf_lock);
 		ci->tcf_action = parm->action;
