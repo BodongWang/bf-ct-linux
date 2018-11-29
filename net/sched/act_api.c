@@ -31,6 +31,8 @@
 #include <net/act_api.h>
 #include <net/netlink.h>
 
+#include <linux/yktrace.h>
+
 static int tcf_action_goto_chain_init(struct tc_action *a, struct tcf_proto *tp)
 {
 	u32 chain_index = a->tcfa_action & TC_ACT_EXT_VAL_MASK;
@@ -1790,11 +1792,14 @@ int tc_setup_cb_egdev_register_unlocked(const struct net_device *dev,
 }
 EXPORT_SYMBOL_GPL(tc_setup_cb_egdev_register_unlocked);
 
+/* TODO: this name (egdev) does not make sense at all anymore */
 int tc_setup_cb_egdev_all_register(const struct net_device *dev,
 				   tc_setup_cb_unlocked_t *cb, void *cb_priv)
 {
 	struct tcf_action_egdev_cb *egdev_cb;
 	struct tcf_action_net *tan;
+
+	mtrace("Registering device \"%s\" as an egdev_all", dev->name);
 
 	egdev_cb = kzalloc(sizeof(*egdev_cb), GFP_KERNEL);
 	if (!egdev_cb)
@@ -1917,6 +1922,23 @@ errout:
 	return ok_count;
 }
 EXPORT_SYMBOL_GPL(tc_setup_cb_egdev_all_call);
+
+/* TODO: The egdev_list list is not protected */
+int tc_setup_cb_egdev_all_call_fast(enum tc_setup_type type, void *type_data)
+{
+	struct tcf_action_net *tan = net_generic(&init_net, tcf_action_net_id);
+	struct tcf_action_egdev_cb *egdev_cb;
+	int err;
+
+	list_for_each_entry(egdev_cb, &tan->egdev_list, list) {
+		err = egdev_cb->cb_unlocked(type, type_data, egdev_cb->cb_priv, false);
+		if (!err)
+			return 1;
+	}
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(tc_setup_cb_egdev_all_call_fast);
 
 static __net_init int tcf_action_net_init(struct net *net)
 {

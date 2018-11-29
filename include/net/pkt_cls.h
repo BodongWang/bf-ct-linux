@@ -620,6 +620,8 @@ int tc_setup_cb_call(struct tcf_block *block, struct tcf_exts *exts,
 		     bool rtnl_held, u32 *flags, spinlock_t *flags_lock,
 		     enum tc_block_update_offloadcnt update_count);
 
+int tc_setup_cb_call_all(struct tcf_block *block, enum tc_setup_type type, void *type_data);
+
 enum tc_block_command {
 	TC_BLOCK_BIND,
 	TC_BLOCK_UNBIND,
