@@ -1761,50 +1761,6 @@ int tc_setup_cb_egdev_call(const struct net_device *dev,
 }
 EXPORT_SYMBOL_GPL(tc_setup_cb_egdev_call);
 
-int tc_setup_cb_egdev_all_call(struct tcf_block *block, enum tc_setup_type type,
-			       void *type_data, bool rtnl_held,
-			       u32 *flags, spinlock_t *flags_lock,
-			       enum tc_block_update_offloadcnt update_count)
-{
-	struct tcf_action_net *tan = net_generic(&init_net, tcf_action_net_id);
-	struct tcf_action_egdev_cb *egdev_cb;
-	int ok_count = 0;
-	int err;
-
-	if (block)
-		down_read(&block->offloads_lock);
-
-	list_for_each_entry(egdev_cb, &tan->egdev_list, list) {
-		/* TODO: merge change */
-		err = egdev_cb->cb_unlocked(type, type_data, egdev_cb->cb_priv, rtnl_held);
-		if (!err) {
-			ok_count++;
-			goto errout;
-		}
-	}
-errout:
-	if (flags_lock)
-		spin_lock(flags_lock);
-	switch (update_count) {
-	case TC_BLOCK_OFFLOADCNT_INC:
-		if (ok_count > 0)
-			tcf_block_offload_inc(block, flags);
-		break;
-	case TC_BLOCK_OFFLOADCNT_DEC:
-		tcf_block_offload_dec(block, flags);
-		break;
-	default:
-		break;
-	}
-	if (flags_lock)
-		spin_unlock(flags_lock);
-
-	if (block)
-		up_read(&block->offloads_lock);
-	return ok_count;
-}
-EXPORT_SYMBOL_GPL(tc_setup_cb_egdev_all_call);
-
 /* TODO: The egdev_list list is not protected */
 int tc_setup_cb_egdev_all_call_fast(enum tc_setup_type type, void *type_data)
 {
