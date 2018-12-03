@@ -845,11 +845,11 @@ enum tc_setup_type {
 	TC_SETUP_QDISC_PRIO,
 	TC_SETUP_QDISC_MQ,
 	TC_SETUP_QDISC_ETF,
-	TC_SETUP_MICROFLOW,
+	TC_SETUP_MINIFLOW,
 	TC_SETUP_CT,
 };
 
-struct tc_microflow_offload {
+struct tc_miniflow_offload {
 	struct sk_buff *skb;
 	unsigned long cookie;
 	bool last_flow;
