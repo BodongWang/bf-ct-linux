@@ -1265,17 +1265,12 @@ mlx5e_tc_add_fdb_flow(struct mlx5e_priv *priv,
 		flow->rule[0] = mlx5e_tc_offload_fdb_rules(esw, flow, &parse_attr->spec, attr);
 	}
 
-	/* NOTE: free mod_hdr_actions on success, otherwise caller responsibility */
-	/* TODO: merge change: this make sense now? */
-	// kfree(parse_attr->mod_hdr_actions);
+	if (IS_ERR(flow->rule[0]))
+		return PTR_ERR(flow->rule[0]);
 
-	/* TODO: merge change; small patch to move this line from mlx5e_add_fdb_flow()  */
 	if (!(flow->esw_attr->action &
 	      MLX5_FLOW_CONTEXT_ACTION_PACKET_REFORMAT))
 		kvfree(parse_attr);
-
-	if (IS_ERR(flow->rule[0]))
-		return PTR_ERR(flow->rule[0]);
 
 	return 0;
 }
@@ -3836,12 +3831,6 @@ mlx5e_add_fdb_flow(struct mlx5e_priv *priv,
 	}
 
 	mlx5_eswitch_read_unlock_mode(esw);
-
-	/* TODO: merge change: this is removed
-	if (!(flow->esw_attr->action &
-	      MLX5_FLOW_CONTEXT_ACTION_PACKET_REFORMAT))
-		kvfree(parse_attr);
-	*/
 
 	*__flow = flow;
 
