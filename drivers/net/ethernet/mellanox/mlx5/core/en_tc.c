@@ -4982,7 +4982,8 @@ int mlx5e_tc_esw_init(struct mlx5e_priv *priv)
 	if (err)
 		goto err_mf_ht;
 
-	miniflow_wq = alloc_workqueue("miniflow", WQ_MEM_RECLAIM | WQ_UNBOUND | WQ_HIGHPRI, 16);
+	miniflow_wq = alloc_workqueue("miniflow", __WQ_LEGACY | WQ_MEM_RECLAIM |
+						  WQ_UNBOUND | WQ_HIGHPRI, 16);
 	if (!miniflow_wq)
 		goto err_wq;
 
