@@ -4488,8 +4488,10 @@ static int __miniflow_merge(struct mlx5e_miniflow *miniflow)
 
 	rcu_read_lock();
 	err = miniflow_verify_path_flows(miniflow);
-	if (err)
+	if (err) {
+		mparse_attr = NULL;
 		goto err_rcu;
+	}
 
 	miniflow_link_dummy_counters(miniflow->flow,
 				      dummy_counters,
@@ -4514,8 +4516,10 @@ static int __miniflow_merge(struct mlx5e_miniflow *miniflow)
 
 err:
 	atomic_inc((atomic_t *)&nr_mf_err);
-	kfree(mparse_attr->mod_hdr_actions);
-	kvfree(mparse_attr);
+	if (mparse_attr) {
+		kfree(mparse_attr->mod_hdr_actions);
+		kvfree(mparse_attr);
+	}
 	kfree(mflow);
 	rhashtable_remove_fast(mf_ht, &miniflow->node, mf_ht_params);
 	miniflow_cleanup(miniflow);
