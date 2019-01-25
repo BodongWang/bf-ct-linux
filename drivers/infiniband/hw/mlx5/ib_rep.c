@@ -3,6 +3,7 @@
  * Copyright (c) 2018 Mellanox Technologies. All rights reserved.
  */
 
+#include <linux/mlx5/vport.h>
 #include "ib_rep.h"
 
 static const struct mlx5_ib_profile rep_profile = {

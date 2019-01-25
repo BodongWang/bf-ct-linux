@@ -2403,7 +2403,7 @@ static int parse_cls_flower(struct mlx5e_priv *priv,
 	is_eswitch_flow = mlx5e_is_eswitch_flow(flow);
 	if (!err && is_eswitch_flow) {
 		rep = rpriv->rep;
-		if (rep->vport != FDB_UPLINK_VPORT &&
+		if (rep->vport != MLX5_VPORT_UPLINK &&
 		    (esw->offloads.inline_mode != MLX5_INLINE_MODE_NONE &&
 		    esw->offloads.inline_mode < match_level)) {
 			NL_SET_ERR_MSG_MOD(extack,
