@@ -1156,7 +1156,7 @@ static void __esw_offloads_unload_rep(struct mlx5_eswitch *esw,
 {
 	if (rep->rep_if[rep_type].state != REP_LOADED)
 		return;
-
+	esw_info(esw->dev, "unload reps vport-(0x%x), type-(%d)\n", rep->vport, rep_type);
 	rep->rep_if[rep_type].unload(rep);
 	rep->rep_if[rep_type].state = REP_REGISTERED;
 }
@@ -1226,6 +1226,7 @@ static int __esw_offloads_load_rep(struct mlx5_eswitch *esw,
 	if (err)
 		return err;
 
+	esw_info(esw->dev, "load reps vport-(0x%x), type-(%d)\n", rep->vport, rep_type);
 	rep->rep_if[rep_type].state = REP_LOADED;
 
 	return 0;
@@ -1395,6 +1396,9 @@ static void esw_host_params_event_handler(struct work_struct *work)
 	err = mlx5_query_host_params_num_vfs(esw->dev, &num_vf);
 	if (err || num_vf == esw->host_info.num_vfs)
 		goto out;
+
+	esw_info(esw->dev, "old_host_nvfs (%d), new_host_nvfs (%d)\n",
+		 esw->host_info.num_vfs, num_vf);
 
 	/* Number of VFs can only change from "0 to x" or "x to 0". */
 	if (esw->host_info.num_vfs > 0) {

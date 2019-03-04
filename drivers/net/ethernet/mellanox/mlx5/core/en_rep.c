@@ -45,7 +45,7 @@
 #include "fs_core.h"
 
 #define MLX5E_REP_PARAMS_LOG_SQ_SIZE \
-	max(0x6, MLX5E_PARAMS_MINIMUM_LOG_SQ_SIZE)
+	max(0x7, MLX5E_PARAMS_MINIMUM_LOG_SQ_SIZE)
 
 static const char mlx5e_rep_driver_name[] = "mlx5e_rep";
 
@@ -168,6 +168,7 @@ static void mlx5e_rep_update_sw_counters(struct mlx5e_priv *priv)
 
 			s->tx_packets		+= sq_stats->packets;
 			s->tx_bytes		+= sq_stats->bytes;
+			s->tx_queue_dropped	+= sq_stats->dropped;
 		}
 	}
 }

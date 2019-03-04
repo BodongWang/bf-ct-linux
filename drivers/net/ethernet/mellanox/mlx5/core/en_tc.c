@@ -2393,8 +2393,8 @@ static int parse_cls_flower(struct mlx5e_priv *priv,
 	      ct_state == (TCA_FLOWER_KEY_CT_FLAGS_TRACKED |
 			   TCA_FLOWER_KEY_CT_FLAGS_ESTABLISHED))) {
 		/* TODO: warn once? */
-		netdev_warn(priv->netdev, "Unsupported ct_state used: key/mask: %x/%x\n",
-			    f->ct_state_key, f->ct_state_mask);
+		trace(priv->netdev, "Unsupported ct_state used: key/mask: %x/%x\n",
+		      f->ct_state_key, f->ct_state_mask);
 		return -EOPNOTSUPP;
        }
 
