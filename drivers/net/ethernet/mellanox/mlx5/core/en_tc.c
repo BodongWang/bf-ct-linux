@@ -3786,7 +3786,8 @@ mlx5e_alloc_flow(struct mlx5e_priv *priv, int attr_size,
 	if (f) {
 		flow->cookie = f->cookie;
 		parse_attr->spec.handle = f->common.handle;
-	}
+	} else
+		parse_attr->spec.handle = U32_MAX;
 
 	atomic_set(&flow->flags, flow_flags);
 	flow->priv = priv;
@@ -4996,24 +4997,27 @@ int mlx5e_tc_esw_init(struct mlx5e_priv *priv, int flags)
 	struct rhashtable *mf_ht = get_mf_ht(priv);
 	int err;
 
+	err = rhashtable_init(tc_ht, &tc_ht_params);
+	if (err)
+		return err;
+
+	err = rhashtable_init(mf_ht, &mf_ht_params);
+	if (err)
+		goto err_mf_ht;
+
 	if (miniflow_cache_allocated)
-		return -EOPNOTSUPP;
+		return 0;
 
 	miniflow_cache = kmem_cache_create("miniflow_cache",
 					    sizeof(struct mlx5e_miniflow),
 					    0, SLAB_HWCACHE_ALIGN,
 					    NULL);
-	if (!miniflow_cache)
-		return -ENOMEM;
+	if (!miniflow_cache) {
+		err = -ENOMEM;
+		goto err_cache;
+	}
+
 	miniflow_cache_allocated = 1;
-
-	err = rhashtable_init(tc_ht, &tc_ht_params);
-	if (err)
-		goto err_tc_ht;
-
-	err = rhashtable_init(mf_ht, &mf_ht_params);
-	if (err)
-		goto err_mf_ht;
 
 	miniflow_wq = alloc_workqueue("miniflow", __WQ_LEGACY | WQ_MEM_RECLAIM |
 						  WQ_UNBOUND | WQ_HIGHPRI | WQ_SYSFS, 16);
@@ -5025,12 +5029,12 @@ int mlx5e_tc_esw_init(struct mlx5e_priv *priv, int flags)
 	return 0;
 
 err_wq:
+	kmem_cache_destroy(miniflow_cache);
+	miniflow_cache_allocated = 0;
+err_cache:
 	rhashtable_free_and_destroy(mf_ht, NULL, NULL);
 err_mf_ht:
 	rhashtable_free_and_destroy(tc_ht, NULL, NULL);
-err_tc_ht:
-	kmem_cache_destroy(miniflow_cache);
-	miniflow_cache_allocated = 0;
 	return err;
 }
 
@@ -5040,15 +5044,18 @@ void mlx5e_tc_esw_cleanup(struct mlx5e_priv *priv, int flags)
 	struct rhashtable *mf_ht = get_mf_ht(priv);
 	int cpu;
 
-	nft_gen_flow_offload_dep_ops_unregister(&ct_offload_ops);
-	/* TODO: it does not make sense to process the remaining miniflows? */
-	flush_workqueue(miniflow_wq);
-	destroy_workqueue(miniflow_wq);
-
 	rhashtable_free_and_destroy(tc_ht, _mlx5e_tc_del_flow, NULL);
 	rhashtable_free_and_destroy(mf_ht, NULL, NULL);
 
 	mlx5_fc_list_cleanup(priv->mdev, &fc_list);
+
+	if (!miniflow_cache_allocated)
+		return;
+
+	nft_gen_flow_offload_dep_ops_unregister(&ct_offload_ops);
+	/* TODO: it does not make sense to process the remaining miniflows? */
+	flush_workqueue(miniflow_wq);
+	destroy_workqueue(miniflow_wq);
 
 	for_each_possible_cpu(cpu) {
 		miniflow_free(per_cpu(current_miniflow, cpu));
